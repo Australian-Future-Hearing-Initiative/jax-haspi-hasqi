@@ -61,11 +61,20 @@ def test_center_frequency_matches():
 
 
 def test_center_frequency_shift_matches():
-  """The shift is exercised even though HASPI never asks for it."""
+  """The shift is exercised even though HASPI never asks for it.
+
+  Not bit-exact, unlike the unshifted case above. The shifted path is the only
+  one that routes through np.log10 and 10**, and libm's last-bit rounding for
+  those is not fixed across numpy builds: numpy 2.4.6 and 2.5.2 disagree by one
+  ULP on channel 11 (792.7504771345069 vs 792.750477134507, 1.4e-16 relative).
+  Asserting bit-equality there tests the C library, not the port. A few ULP is
+  still thirteen orders below the 1e-08 the goldens pin overall.
+  """
   np.testing.assert_allclose(
     ear_model.center_frequency(32, 0.02),
     goldens.stage("center_frequency_32_shift02"),
-    rtol=0,
+    rtol=1e-15,
+    atol=0,
   )
 
 
