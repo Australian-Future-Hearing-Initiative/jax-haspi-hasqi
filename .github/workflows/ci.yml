@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint and test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor from requires-python, and current. The port's tolerances go
+        # to 1e-15, so a numpy or scipy change is a real risk; testing both ends
+        # is what catches it.
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      # No --locked: this is a library with no committed lockfile, so CI
+      # resolves fresh. That is deliberate. The package exists to reproduce
+      # pyclarity 0.9.0 to ~1e-08, and a silent upgrade of numpy or scipy
+      # breaking that is exactly the failure worth hearing about early.
+      - run: uv sync --all-groups
+
+      # Format first: a mechanical reformat should not be reported as a lint
+      # error. Both are blocking.
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+
+      # The goldens are the specification, so the suite is the specification
+      # check. ~70 s, no test selection: at this size testmon would cost more
+      # in cache handling than it saves.
+      - run: uv run pytest -q
+
+  wheel:
+    name: Wheel ships its goldens
+    runs-on: ubuntu-latest
+
+    # A source checkout finds the goldens whether or not they are packaged, so
+    # the suite above passes either way. Only an install from a built wheel
+    # catches the loader resolving a path that does not exist once installed --
+    # which it previously did, raising FileNotFoundError for every caller who
+    # had not pip-installed in editable mode.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      - name: Build and install the wheel into a clean venv
+        run: |
+          uv build --wheel
+          uv venv /tmp/wheeltest
+          uv pip install --python /tmp/wheeltest/bin/python dist/*.whl
+
+      - name: Score a golden case from the installed package
+        run: |
+          /tmp/wheeltest/bin/python - <<'PY'
+          import jax
+
+          jax.config.update("jax_enable_x64", True)
+          from jax_haspi_hasqi import goldens, haspi
+
+          cases = goldens.cases()
+          assert len(cases) == 40, f"expected 40 golden cases, got {len(cases)}"
+
+          case = goldens.case("speech_snr20")
+          score, _ = haspi.haspi_v2(
+            case.reference,
+            case.reference_sample_rate,
+            case.processed,
+            case.processed_sample_rate,
+            case.levels,
+            level1=case.level1,
+            itype=case.itype,
+          )
+          want = case.score("haspi")
+          error = abs(float(score) - want) / want
+          assert error < 1e-9, f"wheel disagrees with its own golden: {error:.2e}"
+          print(f"OK: {len(cases)} goldens packaged, HASPI matches to {error:.1e}")
+          PY

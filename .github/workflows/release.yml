@@ -1,0 +1,76 @@
+name: Release
+
+# Builds a wheel and sdist on a version tag and attaches them to a GitHub
+# Release.
+#
+# It deliberately stops short of publishing to PyPI. That needs a name
+# reservation and a trusted-publishing setup on the PyPI side, neither of
+# which is a thing CI can decide. When they exist, add a job with
+# `permissions: id-token: write` and `pypa/gh-action-pypi-publish`; nothing
+# else here has to change.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      # The tag is the source of truth for the version, so a mismatch with
+      # pyproject.toml means one of the two is wrong. Better to fail here than
+      # to ship a wheel whose filename disagrees with its tag.
+      - name: Check the tag matches the packaged version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          packaged=$(uv version --short)
+          if [ "$tag" != "$packaged" ]; then
+            echo "tag $tag != pyproject version $packaged" >&2
+            exit 1
+          fi
+
+      - run: uv build
+
+      # The goldens are the specification; a release that cannot verify itself
+      # is not a release. Same check as CI, against the artifact being shipped.
+      - name: Verify the built wheel scores a golden case
+        run: |
+          uv venv /tmp/release-check
+          uv pip install --python /tmp/release-check/bin/python dist/*.whl
+          /tmp/release-check/bin/python - <<'PY'
+          import jax
+
+          jax.config.update("jax_enable_x64", True)
+          from jax_haspi_hasqi import goldens, haspi
+
+          case = goldens.case("speech_snr20")
+          score, _ = haspi.haspi_v2(
+            case.reference,
+            case.reference_sample_rate,
+            case.processed,
+            case.processed_sample_rate,
+            case.levels,
+            level1=case.level1,
+            itype=case.itype,
+          )
+          want = case.score("haspi")
+          error = abs(float(score) - want) / want
+          assert error < 1e-9, f"release artifact fails its own golden: {error:.2e}"
+          print(f"OK: {len(goldens.cases())} goldens, HASPI matches to {error:.1e}")
+          PY
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

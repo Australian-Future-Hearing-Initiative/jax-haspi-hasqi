@@ -17,6 +17,7 @@ once warm.
 
 ```python
 import jax
+
 jax.config.update("jax_enable_x64", True)
 
 from jax_haspi_hasqi import haspi, hasqi
@@ -144,6 +145,25 @@ Writes `reference_values.npz` and `manifest.json` into
 so the port never regenerates a signal and never needs pyclarity.
 
 `tools/` is not part of the package.
+
+## Development
+
+```
+uv sync --all-groups
+uv run pytest -q            # ~70 s, 195 tests
+uv run ruff format .
+uv run ruff check .
+```
+
+CI runs exactly those on 3.11 and 3.13, and separately builds a wheel,
+installs it into a clean environment and scores a golden case from it. That
+last job exists because a source checkout finds the goldens whether or not
+they are packaged, so the suite passes either way; only an install catches a
+wheel that ships without its own specification.
+
+There is no committed lockfile. Dependencies resolve fresh on every run, so a
+numpy or scipy release that moves the port off its goldens fails CI rather
+than waiting to be discovered — which is the point of having goldens.
 
 ## Licence
 
