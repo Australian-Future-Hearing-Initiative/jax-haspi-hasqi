@@ -33,8 +33,9 @@ SIGNAL_SEED = 12345
 
 AUDIOGRAM_FREQUENCIES = np.array([250, 500, 1000, 2000, 4000, 6000])
 
-# Named audiograms at the 6 HASPI/HASQI frequencies. "clinical" is the one
-# hp-acoustic passes today (its 8000 Hz point gets resampled onto 6000).
+# Named audiograms at the 6 HASPI/HASQI frequencies. "clinical" is a typical
+# mild-to-moderate sensorineural loss; note that an audiogram measured at
+# 8000 Hz has to be resampled onto 6000 before it reaches these metrics.
 AUDIOGRAMS = {
   "flat_zero": np.zeros(6),
   "mild": np.array([10.0, 15.0, 19.0, 25.0, 31.0, 35.0]),
@@ -339,7 +340,8 @@ def _build_cases():
       f"{duration} s of audio",
     )
 
-  # Presentation level. 107 is what hp-acoustic passes.
+  # Presentation level. 65 is the reference's own default; the higher values
+  # cover callers that calibrate to a louder full-scale level.
   for level1 in (65.0, 100.0, 107.0):
     add(
       f"level1_{int(level1)}",
