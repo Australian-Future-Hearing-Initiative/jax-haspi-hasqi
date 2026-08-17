@@ -363,6 +363,7 @@ def _hasqi_backend(
   return cepstral_correlation, sync_covariance[4], d_loud, d_slope
 
 
+@precision.in_float64
 def hasqi_v2(
   reference,
   reference_rate,
@@ -377,6 +378,11 @@ def hasqi_v2(
   processed_noise=None,
 ):
   """HASQI version 2 quality index.
+
+  Runs in float64 regardless of the caller's JAX configuration, and restores
+  that configuration afterwards; see jax_haspi_hasqi.precision for why the
+  filter bank leaves no choice. Passing float32 inputs is fine and costs about
+  2e-09 against a native float64 run.
 
   Args:
     reference: Clean reference signal.
@@ -395,7 +401,6 @@ def hasqi_v2(
     The combined score, its nonlinear and linear parts, and the four raw terms
     [cepstral correlation, BM sync5, d_loud, d_slope].
   """
-  precision.require_x64()
   (
     reference_db,
     reference_bm,

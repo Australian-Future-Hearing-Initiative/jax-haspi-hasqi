@@ -75,9 +75,9 @@ jobs:
       - name: Score a golden case from the installed package
         run: |
           /tmp/wheeltest/bin/python - <<'PY'
-          import jax
-
-          jax.config.update("jax_enable_x64", True)
+          # Deliberately no jax.config.update here: an installed wheel must
+          # work for a caller who has configured nothing, which is the whole
+          # point of promoting internally.
           from jax_haspi_hasqi import goldens, haspi
 
           cases = goldens.cases()

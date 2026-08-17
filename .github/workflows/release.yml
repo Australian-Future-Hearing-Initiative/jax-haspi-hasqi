@@ -49,9 +49,9 @@ jobs:
           uv venv /tmp/release-check
           uv pip install --python /tmp/release-check/bin/python dist/*.whl
           /tmp/release-check/bin/python - <<'PY'
-          import jax
-
-          jax.config.update("jax_enable_x64", True)
+          # Deliberately no jax.config.update here: an installed wheel must
+          # work for a caller who has configured nothing, which is the whole
+          # point of promoting internally.
           from jax_haspi_hasqi import goldens, haspi
 
           case = goldens.case("speech_snr20")
