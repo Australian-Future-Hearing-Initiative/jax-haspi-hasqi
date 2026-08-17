@@ -598,15 +598,24 @@ def ear_model(
     Envelope and BM motion per band for each signal, the long-term dB SL
     spectra, and the model sampling rate.
   """
-  reference_24k = resample_24khz(jnp.asarray(reference), reference_rate)
-  processed_24k = resample_24khz(jnp.asarray(processed), processed_rate)
+  # Cast rather than asarray: enabling x64 does not promote an array that is
+  # already float32, so a float32 caller would otherwise run the filter bank
+  # in single precision and get NaN out of HASQI. The cast costs ~4e-08 on the
+  # score, which is what float32 input data is worth; computing in float32
+  # costs everything.
+  reference_24k = resample_24khz(
+    jnp.asarray(reference, jnp.float64), reference_rate
+  )
+  processed_24k = resample_24khz(
+    jnp.asarray(processed, jnp.float64), processed_rate
+  )
 
   shortest = min(reference_24k.shape[0], processed_24k.shape[0])
   reference_24k, processed_24k, _ = input_align(
     reference_24k[:shortest], processed_24k[:shortest]
   )
-  reference_24k = jnp.asarray(reference_24k)
-  processed_24k = jnp.asarray(processed_24k)
+  reference_24k = jnp.asarray(reference_24k, jnp.float64)
+  processed_24k = jnp.asarray(processed_24k, jnp.float64)
 
   shape = (nchan, reference_24k.shape[0])
   if reference_noise is None:

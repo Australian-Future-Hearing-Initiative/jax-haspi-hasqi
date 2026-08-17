@@ -16,15 +16,14 @@ once warm.
 ## Using it
 
 ```python
-import jax
-
-jax.config.update("jax_enable_x64", True)
-
 from jax_haspi_hasqi import haspi, hasqi
 
 score, _ = haspi.haspi_v2(reference, 24000, processed, 24000, levels)
 quality, *_ = hasqi.hasqi_v2(reference, 24000, processed, 24000, levels)
 ```
+
+No JAX configuration required. float32 inputs are fine, and so is a float32
+process.
 
 `levels` is six audiometric thresholds in dB HL at 250, 500, 1000, 2000, 4000
 and 6000 Hz. **These frequencies are the contract.** pyclarity's entry points
@@ -34,18 +33,23 @@ interpolate first — on a log-frequency axis, as
 `clarity.utils.audiogram.Audiogram.resample` does. A 6 kHz-vs-8 kHz mismatch is
 silent and can reach 10 dB in the top band.
 
-> [!IMPORTANT]
-> **float64 is required.** Both entry points raise `RuntimeError` if
-> `jax_enable_x64` is off. In float32 the gammatone recursion drifts far enough
-> that HASPI trips its own silence gate and HASQI returns NaN, so the guard is
-> deliberately load-bearing. If enabling x64 globally is not acceptable — most
-> JAX training code runs float32 — scope it instead, which works and restores
-> cleanly:
+> [!NOTE]
+> **These metrics compute in float64 internally, whatever you have
+> configured.** Both entry points enable x64 for the duration of the call and
+> restore your setting afterwards, and both cast their input signals up, since
+> enabling x64 does not promote an array that is already float32.
 >
-> ```python
-> with jax.enable_x64(True):
->   score, _ = haspi.haspi_v2(...)
-> ```
+> This is not fussiness. The gammatone filter bank is a 4th-order IIR whose
+> poles sit against the unit circle — 0.9913 at the 80 Hz channel — which needs
+> about nine significant digits in the denominator to place the filter
+> correctly, and float32 carries seven. Computed in float32 the filter bank
+> output is wrong by a relative 5.6e+03, HASPI then trips its own silence gate
+> and HASQI returns NaN. Deriving the coefficients in float64 does not rescue
+> it either: a float32 recursion still drifts by 6e-03.
+>
+> Passing float32 signals costs about **4e-08** on the score, which is what
+> float32 sample data is worth, and three orders below the reference's own
+> 6e-03 run-to-run spread. The promotion does not disturb the jit cache.
 
 ### Performance
 

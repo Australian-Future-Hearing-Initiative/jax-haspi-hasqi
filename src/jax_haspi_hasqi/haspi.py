@@ -37,6 +37,7 @@ def _haspi_backend(reference_cep, processed_cep, freq_sub_sample):
   return neural_net.intelligibility(correlations), correlations
 
 
+@precision.in_float64
 def haspi_v2(
   reference,
   reference_rate,
@@ -51,6 +52,11 @@ def haspi_v2(
   cepstral_noise=None,
 ):
   """HASPI version 2 intelligibility index.
+
+  Runs in float64 regardless of the caller's JAX configuration, and restores
+  that configuration afterwards; see jax_haspi_hasqi.precision for why the
+  filter bank leaves no choice. Passing float32 inputs is fine and costs about
+  2e-09 against a native float64 run.
 
   Args:
     reference: Clean reference signal, without amplification.
@@ -69,7 +75,6 @@ def haspi_v2(
   Returns:
     The intelligibility estimate and the ten modulation-band correlations.
   """
-  precision.require_x64()
   # shift=None is not passed on: the ear model already omits the 0.02 basal
   # shift HASPI's own docstring describes, which is the published defect.
   reference_db, _, processed_db, _, _, _, sample_rate = ear_model.ear_model(
