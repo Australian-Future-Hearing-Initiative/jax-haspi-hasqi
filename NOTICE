@@ -10,7 +10,7 @@ HASPI v2 and HASQI v2 intelligibility and quality metrics as published in:
     Licensed under the MIT License.
 
 The full text of the pyclarity licence is reproduced in
-third_party/pyclarity/LICENSE.
+licenses/pyclarity/LICENSE.
 
 The modules below are ports of the correspondingly named pyclarity 0.9.0
 modules. Their structure, variable naming, numerical constants and behaviour --
