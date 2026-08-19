@@ -172,7 +172,7 @@ than waiting to be discovered — which is the point of having goldens.
 ## Licence
 
 MIT. This is a derivative work of pyclarity, also MIT — see [NOTICE](NOTICE)
-for attribution and [third_party/pyclarity/](third_party/pyclarity/) for the
+for attribution and [licenses/pyclarity/](licenses/pyclarity/) for the
 upstream licence. The algorithms are due to James M. Kates; citations are in
 `NOTICE`.
 
