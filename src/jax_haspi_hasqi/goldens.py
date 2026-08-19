@@ -2,15 +2,17 @@
 
 import dataclasses
 import functools
+import importlib.resources
 import json
-import pathlib
 from typing import Any
 
 import numpy as np
 
 # Inside the package, not beside it: resolving relative to the source tree
 # worked only in an editable install and raised FileNotFoundError from a wheel.
-_GOLDENS = pathlib.Path(__file__).resolve().parent / "_golden_data"
+# Resolved through importlib rather than __file__ so that it also works where
+# the modules are not plain files on disk beside their data.
+_GOLDENS = importlib.resources.files(__package__).joinpath("_golden_data")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,7 +56,10 @@ def manifest() -> dict[str, Any]:
 
 @functools.cache
 def _arrays() -> dict[str, np.ndarray]:
-  with np.load(_GOLDENS / "reference_values.npz") as data:
+  with (
+    (_GOLDENS / "reference_values.npz").open("rb") as handle,
+    np.load(handle) as data,
+  ):
     return {key: data[key] for key in data.files}
 
 
