@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import lax
 
 from jax_haspi_hasqi import ear_model
 from jax_haspi_hasqi import goldens
@@ -189,3 +190,49 @@ def test_input_align_prunes_leading_silence():
   reference, processed, (start, _, _) = ear_model.input_align(signal, signal)
   assert start == 500
   assert len(reference) == len(processed) == 1000
+
+
+def test_envelope_align_recovers_a_known_shift():
+  """Shifting back restores the overlap; the vacated tail stays zero."""
+  rng = np.random.default_rng(0)
+  reference = rng.standard_normal(2000)
+  shift = 37
+  shifted = np.concatenate((np.zeros(shift), reference[:-shift]))
+  got = np.asarray(
+    ear_model.envelope_align(jnp.asarray(reference), jnp.asarray(shifted))
+  )
+  np.testing.assert_allclose(got[:-shift], reference[:-shift], atol=1e-12)
+  np.testing.assert_array_equal(got[-shift:], np.zeros(shift))
+
+
+def test_top_k_breaks_ties_towards_the_lower_lag():
+  """Pins the tie rule that keeps a fully silent case on its usual lag.
+
+  A silent input correlates to exactly zero everywhere, so nothing
+  distinguishes the lags and the tie rule alone decides. top_k resolves ties
+  to the lower index, matching argmax; argpartition returns the highest lags
+  instead and would shift the silent golden case.
+
+  This pins the property rather than guarding the substitution: a silent
+  window maps every lag to the same all-zero output, so no assertion made
+  through envelope_align can observe the wrong choice. It fails only if top_k
+  itself changes, and exists so the requirement stays written down.
+  """
+  window = jnp.zeros(799)
+
+  assert np.array_equal(np.asarray(lax.top_k(window, 8)[1]), np.arange(8))
+  assert int(jnp.argmax(window)) == 0
+
+  # The behaviour being ruled out, recorded so the risk stays visible.
+  assert np.argpartition(-np.asarray(window), 7)[:8].min() > 8
+
+
+def test_envelope_align_is_insensitive_to_the_shortlist_size():
+  """Any shortlist deep enough to hold the peak must give the same answer."""
+  rng = np.random.default_rng(1)
+  reference = jnp.asarray(rng.standard_normal(1500))
+  output = jnp.asarray(rng.standard_normal(1500))
+  want = np.asarray(ear_model.envelope_align(reference, output, candidates=2))
+  for candidates in (4, 8, 16):
+    got = ear_model.envelope_align(reference, output, candidates=candidates)
+    np.testing.assert_array_equal(np.asarray(got), want)
