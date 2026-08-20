@@ -31,18 +31,31 @@ def lfilter(b, a, x):
   return out
 
 
-def correlate_full(x, y):
+def correlate_full(x, y, dtype=None):
   """scipy.signal.correlate(x, y, 'full').
 
   Via FFT: `jnp.convolve` lowers to a general convolution whose cost explodes
   when both operands are batched by vmap, which is how the filter bank uses
   it. Agreement with the direct form is ~1e-12 relative, far below the port's
   error floor.
+
+  Args:
+    x: First input signal.
+    y: Second input signal.
+    dtype: Precision for the transform only; the result is returned in x's
+      dtype. Defaults to x's dtype. Accelerators that reject float64 FFT
+      operands need float32 here, at a cost of ~8 significant digits. Callers
+      that reduce the result to a magnitude can absorb that; callers that
+      resolve a discrete argmax over it cannot, as neighbouring correlation
+      peaks can sit closer together than float32 can represent.
   """
   n = x.shape[0] + y.shape[0] - 1
   size = 1 << int(np.ceil(np.log2(n)))
-  spectrum = jnp.fft.rfft(x, size) * jnp.fft.rfft(y[::-1], size)
-  return jnp.fft.irfft(spectrum, size)[:n]
+  compute = x.dtype if dtype is None else dtype
+  spectrum = jnp.fft.rfft(x.astype(compute), size) * jnp.fft.rfft(
+    y[::-1].astype(compute), size
+  )
+  return jnp.fft.irfft(spectrum, size)[:n].astype(x.dtype)
 
 
 def group_delay_at_dc(b, a):
