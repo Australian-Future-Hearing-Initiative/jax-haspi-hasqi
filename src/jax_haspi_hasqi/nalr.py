@@ -28,6 +28,9 @@ def _inverse_transform(length, grid_len):
   design in the caller's precision on accelerators that reject float64 FFT
   operands, and discards nothing it paid for: the transform computes
   2*(grid_len-1) samples to keep `length` of them.
+
+  Returns a NumPy array: the cache outlives any one trace, so converting
+  here would cache a tracer from whichever call traced first.
   """
   delay = 0.5 * (length - 1)
   size = 2 * (grid_len - 1)
@@ -38,7 +41,7 @@ def _inverse_transform(length, grid_len):
   # Every bin but DC and Nyquist appears twice in the Hermitian spectrum.
   weight = np.full(grid_len, 2.0)
   weight[0] = weight[-1] = 1.0
-  return jnp.asarray(np.cos(angle) * weight / size)
+  return np.cos(angle) * weight / size
 
 
 def _fir2(order, frequencies, gains, n_interpolate=512):
@@ -74,7 +77,9 @@ def _fir2(order, frequencies, gains, n_interpolate=512):
     )
     start = end + 1
 
-  return (_inverse_transform(length, grid_len) @ response) * window
+  transform = jnp.asarray(_inverse_transform(length, grid_len), response.dtype)
+
+  return (transform @ response) * window
 
 
 def build(hearing_loss, n_fir=140, sample_rate=24000.0):
