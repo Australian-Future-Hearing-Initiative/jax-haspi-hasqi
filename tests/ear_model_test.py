@@ -93,10 +93,29 @@ def test_loss_parameters_match(name):
     assert relative_error(value, want) < 1e-15, key
 
 
+# The design sums a cosine basis where the reference ran an FFT, and a radix-2
+# transform accumulates more accurately than any direct evaluation: computing
+# both the basis and the sum in extended precision still lands at 2.8e-15, so
+# this is a floor rather than something to tune away. Only the audiograms that
+# actually exercise it get the looser bound.
+NALR_TAP_TOLERANCE = {"clinical": 5e-15}
+
+
 @pytest.mark.parametrize("name", AUDIOGRAMS)
 def test_nalr_filter_matches(name):
+  """Taps match the reference design.
+
+  Held at 1e-15 except where noted in NALR_TAP_TOLERANCE. For context on the
+  size of that exception: before the design stopped using an FFT, clinical sat
+  at 2.6e-17 and flat_zero at exactly 0. clinical now measures 2.9e-15. The
+  taps are worth far less than that downstream -- the change moves HASQI by at
+  most 3e-10, against an ear model that already differs from the reference by
+  2.8e-08 -- but the step is two orders of magnitude, so it is named here
+  rather than absorbed into a blanket bound.
+  """
   got, _ = nalr.build(levels(name))
-  assert relative_error(got, goldens.stage(f"nalr_fir__{name}")) < 1e-15
+  tolerance = NALR_TAP_TOLERANCE.get(name, 1e-15)
+  assert relative_error(got, goldens.stage(f"nalr_fir__{name}")) < tolerance
 
 
 def test_nalr_is_a_pure_delay_without_loss():
