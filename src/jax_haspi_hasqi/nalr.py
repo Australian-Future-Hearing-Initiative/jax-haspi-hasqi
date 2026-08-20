@@ -8,12 +8,37 @@ the linear rule from that paper, and is not NAL-NL1 or NAL-NL2, which are
 separately licensed. See NOTICE.
 """
 
+import functools
+
 import jax.numpy as jnp
 import numpy as np
 import scipy.signal.windows
 
 NALR_FREQUENCIES = np.array([250.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0])
 _BIAS = np.array([-17.0, -8.0, 1.0, -1.0, -2.0, -2.0])
+
+
+@functools.lru_cache(maxsize=None)
+def _inverse_transform(length, grid_len):
+  """The linear map _fir2's inverse transform applies, as a real matrix.
+
+  The spectrum _fir2 builds is Hermitian, and only its first `length` real
+  samples survive, so the inverse transform reduces to a cosine sum over the
+  half spectrum. Evaluating that directly rather than as a transform keeps the
+  design in the caller's precision on accelerators that reject float64 FFT
+  operands, and discards nothing it paid for: the transform computes
+  2*(grid_len-1) samples to keep `length` of them.
+  """
+  delay = 0.5 * (length - 1)
+  size = 2 * (grid_len - 1)
+  bins = np.arange(grid_len)
+  angle = 2 * np.pi * np.outer(np.arange(length), bins) / size - (
+    delay * np.pi * bins / (grid_len - 1)
+  )
+  # Every bin but DC and Nyquist appears twice in the Hermitian spectrum.
+  weight = np.full(grid_len, 2.0)
+  weight[0] = weight[-1] = 1.0
+  return jnp.asarray(np.cos(angle) * weight / size)
 
 
 def _fir2(order, frequencies, gains, n_interpolate=512):
@@ -49,13 +74,7 @@ def _fir2(order, frequencies, gains, n_interpolate=512):
     )
     start = end + 1
 
-  delay = 0.5 * (length - 1)
-  phase = -delay * 1j * np.pi * np.arange(grid_len) / (grid_len - 1)
-  response = response * jnp.exp(jnp.asarray(phase))
-  spectrum = jnp.concatenate(
-    (response, jnp.conj(response[grid_len - 2 : 0 : -1]))
-  )
-  return jnp.real(jnp.fft.ifft(spectrum))[:length] * window
+  return (_inverse_transform(length, grid_len) @ response) * window
 
 
 def build(hearing_loss, n_fir=140, sample_rate=24000.0):
