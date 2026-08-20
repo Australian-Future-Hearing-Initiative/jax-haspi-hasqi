@@ -219,10 +219,10 @@ def bm_covary(
     processed_ms = jnp.sum(processed_seg**2, axis=-1) * power
 
     length = reference_seg.shape[-1]
-    correlation = filters.correlate_full(
-      reference_seg, processed_seg, dtype=jnp.float32
-    )
-    correlation = correlation[length - 1 - max_lag : max_lag + length]
+    # Only 49 of the 767 lags survive the slice, so a transform over all of
+    # them is wasted work; correlating just these keeps float64 as well.
+    lags = jnp.arange(length - 1 - max_lag, max_lag + length)
+    correlation = filters.correlate_at_lags(reference_seg, processed_seg, lags)
     peak = jnp.max(jnp.abs(correlation * correction))
 
     valid = (reference_ms > _SMALL) & (processed_ms > _SMALL)
