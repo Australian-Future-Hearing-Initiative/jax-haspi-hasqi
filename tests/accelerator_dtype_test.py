@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax._src.interpreters import mlir
-from jaxlib.mlir import ir
+from jax._src.lib.mlir import ir
 
 from jax_haspi_hasqi import goldens
 from jax_haspi_hasqi import haspi
@@ -187,3 +187,21 @@ def test_hasqi_emits_no_float64_transform(audiogram, equalisation):
     )
 
   assert_single_precision_transforms(modules)
+
+
+def test_design_cache_survives_tracing():
+  """The design cache must outlive the trace that fills it.
+
+  `_inverse_transform` is `lru_cache`d and first runs inside whichever `jit`
+  traces first, so returning a JAX array would cache a tracer and every later
+  caller would get one belonging to a dead trace.
+  """
+  nalr._inverse_transform.cache_clear()
+
+  jax.block_until_ready(
+    jax.jit(lambda x: x * nalr._inverse_transform(97, 513).sum())(
+      jnp.float32(1.0)
+    )
+  )
+
+  assert isinstance(nalr._inverse_transform(97, 513), np.ndarray)
