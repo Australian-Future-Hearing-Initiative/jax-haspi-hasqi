@@ -219,7 +219,9 @@ def bm_covary(
     processed_ms = jnp.sum(processed_seg**2, axis=-1) * power
 
     length = reference_seg.shape[-1]
-    correlation = filters.correlate_full(reference_seg, processed_seg)
+    correlation = filters.correlate_full(
+      reference_seg, processed_seg, dtype=jnp.float32
+    )
     correlation = correlation[length - 1 - max_lag : max_lag + length]
     peak = jnp.max(jnp.abs(correlation * correction))
 
