@@ -7,7 +7,7 @@ from jax_haspi_hasqi import goldens
 from jax_haspi_hasqi import haspi
 from jax_haspi_hasqi import hasqi
 
-TOLERANCE = 1e-7
+TOLERANCE = 1e-8
 
 HASPI_CASES = ("tone_snr20", "audiogram_clinical", "processed_silent")
 HASQI_CASES = ("tone_snr20", "audiogram_clinical", "scaled_half")
