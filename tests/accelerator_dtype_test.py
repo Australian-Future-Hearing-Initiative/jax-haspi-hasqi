@@ -21,13 +21,14 @@ actually compile, at the shapes they actually use.
 """
 
 import contextlib
+import pathlib
+import re
+import tempfile
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax._src.interpreters import mlir
-from jax._src.lib.mlir import ir
 
 from jax_haspi_hasqi import goldens
 from jax_haspi_hasqi import haspi
@@ -48,69 +49,52 @@ def levels(name):
 def captured_lowerings():
   """Collect the StableHLO of every module lowered inside the block.
 
-  Hooks the lowering entry point, which is not public API. If a JAX upgrade
-  moves it the patch stops collecting, so every caller asserts it saw at least
-  one module and test_the_guard_detects_a_float64_transform plants one to
-  prove the whole path still reports.
+  Asks JAX to dump each module it lowers, which reaches the regions the
+  metrics compile internally and not just a top-level call. Every caller
+  asserts it saw at least one module and
+  test_the_guard_detects_a_float64_transform plants one to prove the whole
+  path still reports.
   """
-  modules = []
-  original = mlir.lower_jaxpr_to_module
-
-  def record(*args, **kwargs):
-    result = original(*args, **kwargs)
-    modules.append(result.module)
-    return result
-
-  mlir.lower_jaxpr_to_module = record
-  try:
-    # Lowerings are cached, so only a cold cache lowers anything at all.
-    jax.clear_caches()
-    yield modules
-  finally:
-    mlir.lower_jaxpr_to_module = original
+  with tempfile.TemporaryDirectory() as directory:
+    jax.config.update("jax_dump_ir_to", directory)
+    try:
+      # Lowerings are cached, so only a cold cache lowers anything at all.
+      jax.clear_caches()
+      modules = []
+      yield modules
+    finally:
+      jax.config.update("jax_dump_ir_to", None)
+    modules.extend(
+      path.read_text() for path in sorted(pathlib.Path(directory).iterdir())
+    )
 
 
-def _operations(operation):
-  """Every operation below `operation`, at any nesting depth."""
-  for region in operation.regions:
-    for block in region.blocks:
-      for child in block.operations:
-        yield child
-        yield from _operations(child.operation)
-
-
-def float_width(mlir_type):
-  """Floating width in bits of a tensor's element type, unwrapping complex.
-
-  Read through the MLIR type API rather than parsed out of the printed form:
-  the spelling of a shaped complex type is not something to depend on.
-  """
-  element = ir.ShapedType(mlir_type).element_type
-  try:
-    element = ir.ComplexType(element).element_type
-  except ValueError:
-    pass
-  width = getattr(element, "width", None)
-  # An FFT operand is float or complex-float, so anything else is a signal
-  # that this is reading the wrong thing rather than a transform to allow.
-  assert width is not None, f"FFT operand of unexpected type {element}"
-  return width
+# Operands and results of a printed op follow the final colon, as
+# `(tensor<...>, ...) -> tensor<...>`; f64 there is what this forbids.
+_FFT_LINE = re.compile(r"^\s*%\S+ = stablehlo\.fft .*?:(?P<types>.*)$")
+_FLOAT_WIDTH = re.compile(r"\bf(?P<width>\d+)\b")
 
 
 def fft_float_widths(modules):
   """Floating width of every FFT operand and result across the modules."""
   widths = []
   for module in modules:
-    for operation in _operations(module.operation):
-      if operation.operation.name != "stablehlo.fft":
+    for line in module.splitlines():
+      match = _FFT_LINE.match(line)
+      if match is None:
         continue
-      for value in [*operation.operands, *operation.results]:
-        widths.append(float_width(value.type))
+      types = match.group("types")
+      found = _FLOAT_WIDTH.findall(types)
+      # An FFT operand is float or complex-float, so no float element type at
+      # all means this is reading the wrong thing rather than a transform to
+      # allow.
+      assert found, f"FFT operand of unexpected type {types.strip()}"
+      widths.extend(int(width) for width in found)
   return widths
 
 
 def assert_single_precision_transforms(modules):
-  assert modules, "no lowering captured; the hook is no longer being called"
+  assert modules, "no lowering captured; the dump is no longer being written"
   offending = sorted(
     width for width in set(fft_float_widths(modules)) if width > MAX_FFT_WIDTH
   )
