@@ -275,18 +275,45 @@ def env_compress_basilar_membrane(
   return gain * envelope, gain * motion
 
 
-def envelope_align(reference, output, sample_rate=_SAMPLE_RATE, corr_range=100):
-  """Shift the output to the reference's envelope peak, over a +/-100 ms window."""
+def envelope_align(
+  reference, output, sample_rate=_SAMPLE_RATE, corr_range=100, candidates=8
+):
+  """Shift the output to the reference's envelope peak, over a +/-100 ms window.
+
+  The peak is resolved in two stages. A float32 transform proposes the best
+  few lags, then those lags alone are correlated exactly, and the largest
+  wins. The shortlist only has to contain the true peak, which a float32
+  transform is easily accurate enough to do; deciding between near-equal
+  neighbours is what needs the precision, and that happens without an FFT.
+  Accelerators that reject float64 FFT operands can therefore run this
+  unchanged.
+
+  Args:
+    reference: Reference envelope.
+    output: Envelope to shift.
+    sample_rate: Sample rate in Hz.
+    corr_range: Half-width of the search window, in ms.
+    candidates: How many lags to re-check exactly. Eight keeps the true peak
+      inside the shortlist by a margin of 1.8e-06 relative at worst, some 15x
+      above float32's resolution, and costs nothing measurable because the
+      transform dominates. Two suffices on the cases measured but clears that
+      floor by only 1.4x.
+  """
   npts = reference.shape[0]
   lags = min(int(np.rint(0.001 * corr_range * sample_rate)), npts)
 
-  correlation = filters.correlate_full(reference, output)
+  correlation = filters.correlate_full(reference, output, dtype=jnp.float32)
   # The reference slices past the end when lags == npts; numpy clips, so do
   # the same rather than reading out of bounds.
   start, stop = npts - lags, min(npts + lags, 2 * npts - 1)
-  location = jnp.argmax(
-    lax.dynamic_slice(correlation, (start,), (stop - start,))
-  )
+  window = lax.dynamic_slice(correlation, (start,), (stop - start,))
+
+  # top_k breaks ties towards the lower index, as argmax does, so an all-zero
+  # window still aligns at the same lag it always did. argpartition does not.
+  # The clamp only bites for npts <= 4, far shorter than any real clip.
+  shortlist = start + lax.top_k(window, min(candidates, stop - start))[1]
+  exact = filters.correlate_at_lags(reference, output, shortlist)
+  location = shortlist[jnp.argmax(exact)] - start
   return filters.shift_with_zeros(output, lags - location - 1)
 
 

@@ -2,6 +2,7 @@
 
 import math
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.signal
@@ -56,6 +57,33 @@ def correlate_full(x, y, dtype=None):
     y[::-1].astype(compute), size
   )
   return jnp.fft.irfft(spectrum, size)[:n].astype(x.dtype)
+
+
+def correlate_at_lags(x, y, indices):
+  """correlate_full(x, y)[indices], evaluated directly rather than transformed.
+
+  Each index costs one dot product, so this is only worth it for a handful of
+  lags; in exchange it needs no FFT and so keeps the caller's precision on
+  accelerators that reject float64 FFT operands.
+
+  Args:
+    x: First input signal.
+    y: Second input signal, the same length as x.
+    indices: Indices into the length 2*n-1 full correlation.
+
+  Returns:
+    The correlation at those indices, in x's dtype.
+  """
+  n = x.shape[0]
+  positions = jnp.arange(n)
+
+  def at(index):
+    # correlate_full index k is the lag d = k - (n - 1), so y is read at t - d.
+    taps = positions - (index - (n - 1))
+    inside = (taps >= 0) & (taps < n)
+    return jnp.sum(x * jnp.where(inside, y[jnp.clip(taps, 0, n - 1)], 0))
+
+  return jax.vmap(at)(indices)
 
 
 def group_delay_at_dc(b, a):

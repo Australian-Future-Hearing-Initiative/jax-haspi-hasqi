@@ -64,3 +64,39 @@ def test_single_precision_costs_accuracy():
 
   assert double < 1e-12
   assert single > double
+
+
+def test_correlate_at_lags_matches_the_full_correlation():
+  for n in (64, 301):
+    x, y = _signals(n, n)
+    x, y = jnp.asarray(x), jnp.asarray(y)
+    want = np.asarray(filters.correlate_full(x, y))
+    indices = jnp.arange(n - 5, n + 4)
+    got = np.asarray(filters.correlate_at_lags(x, y, indices))
+    np.testing.assert_allclose(got, want[np.asarray(indices)], rtol=1e-12)
+
+
+def test_correlate_at_lags_beats_a_single_precision_transform():
+  """The point of the helper: exact lags without a float64 transform."""
+  x, y = _signals(256, 256)
+  x, y = jnp.asarray(x), jnp.asarray(y)
+  want = scipy.signal.correlate(np.asarray(x), np.asarray(y), "full")
+  indices = np.arange(250, 262)
+
+  direct = np.asarray(filters.correlate_at_lags(x, y, jnp.asarray(indices)))
+  transformed = np.asarray(filters.correlate_full(x, y, dtype=jnp.float32))[
+    indices
+  ]
+
+  assert np.max(np.abs(direct - want[indices])) < 1e-12
+  assert np.max(np.abs(transformed - want[indices])) > 1e-9
+
+
+def test_correlate_at_lags_handles_the_ends():
+  """The first and last lags overlap in a single sample."""
+  x, y = _signals(32, 32)
+  x, y = jnp.asarray(x), jnp.asarray(y)
+  want = np.asarray(filters.correlate_full(x, y))
+  indices = jnp.asarray([0, 1, 62])
+  got = np.asarray(filters.correlate_at_lags(x, y, indices))
+  np.testing.assert_allclose(got, want[np.asarray(indices)], rtol=1e-12)
