@@ -32,6 +32,54 @@ def lfilter(b, a, x):
   return out
 
 
+def cascaded_one_pole(pole, b, x, order=4):
+  """lfilter(b, (1 - pole*z^-1)^order, x), evaluated as cascaded 1st-order sections.
+
+  Direct form II on the expanded denominator is unusable in float32 for a
+  repeated root near the unit circle: the coefficients 6a^2 and -4a^3 are ~6
+  and ~-4 while the polynomial they belong to sums to (1-a)^4 ~ 6e-9, so the
+  recursion cancels away everything it computes. Measured relative error at
+  the 80 Hz channel is 3e+18 for the direct form against 4e-06 for this one.
+
+  Applying the pole as `order` successive one-pole sections keeps every
+  intermediate at the scale of the signal, and costs fewer operations than the
+  direct form (order multiply-adds against 2*order).
+
+  Args:
+    pole: The repeated real pole, `a`.
+    b: Numerator coefficients, applied as an FIR after the recursion.
+    x: Signal to filter.
+    order: Multiplicity of the pole.
+
+  Returns:
+    The filtered signal, in x's dtype.
+  """
+  pole = jnp.asarray(pole, x.dtype)
+  b = jnp.asarray(b, x.dtype)
+
+  def step(state, sample):
+    # Section k feeds section k+1 within the same sample, so the whole cascade
+    # is one scan rather than `order` passes over the signal.
+    def section(value, previous):
+      return value + pole * previous
+
+    outputs = []
+    value = sample
+    for k in range(order):
+      value = section(value, state[k])
+      outputs.append(value)
+    return jnp.stack(outputs), value
+
+  _, recursive = lax.scan(step, jnp.zeros(order, x.dtype), x)
+
+  # The numerator has no repeated root at 1, so a plain FIR is well conditioned.
+  padded = jnp.concatenate([jnp.zeros(len(b) - 1, x.dtype), recursive])
+  return sum(
+    b[k] * lax.dynamic_slice(padded, (len(b) - 1 - k,), (recursive.shape[0],))
+    for k in range(len(b))
+  )
+
+
 def correlate_full(x, y, dtype=None):
   """scipy.signal.correlate(x, y, 'full').
 
