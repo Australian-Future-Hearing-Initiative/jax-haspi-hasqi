@@ -15,6 +15,10 @@ _EAR_Q = 9.26449
 _MIN_BANDWIDTH = 24.7
 _SAMPLE_RATE = 24000.0
 _SMALL = 1e-30
+# Sentinel shift used if a group delay is non-finite. Large and negative so it
+# cannot be mistaken for a plausible alignment, unlike the INT_MIN that a
+# silent cast of inf would produce.
+_BAD_DELAY = -1_000_000.0
 _THRESHOLD_HIGH = 100.0
 _IHC_THRESHOLD = -10.0
 _IHC_OVERSHOOT = 2.0
@@ -168,6 +172,15 @@ def middle_ear(signal, sample_rate=_SAMPLE_RATE):
 
 
 def _gammatone_coefficients(bandwidth, centre_freq, sample_rate):
+  """Coefficients of the 4th-order gammatone section, plus its pole.
+
+  The denominator is (1 - a z^-1)^4, so several derived quantities are exactly
+  (1-a)^4. That is ~6e-9 at the 80 Hz channel, and expanding the polynomial to
+  reach it costs about nine digits of cancellation against terms of size six.
+  float32 has seven, so the expanded forms collapse to zero or change sign.
+  Anything algebraically equal to (1-a)^4 is therefore kept factored here, and
+  `a` is returned so callers can do the same.
+  """
   erb = _MIN_BANDWIDTH + (centre_freq / _EAR_Q)
   tpt = 2 * np.pi / sample_rate
   a = jnp.exp(-bandwidth * tpt * erb * 1.019)
@@ -178,10 +191,13 @@ def _gammatone_coefficients(bandwidth, centre_freq, sample_rate):
     -(a**4),
     4.0 * a * a,
   )
-  gain = 2.0 * (1 - a_1 - a_2 - a_3 - a_4) / (1 + a_1 + a_5)
+  # 1 - 4a + 6a^2 - 4a^3 + a^4 == (1-a)^4 and 1 + 4a + 4a^2 == (1+2a)^2, both
+  # exactly. The factored form is also the more accurate one in float64: the
+  # expanded numerator is already 6.3e-08 relative off at 80 Hz.
+  gain = 2.0 * (1.0 - a) ** 4 / (1.0 + 2.0 * a) ** 2
   numerator = jnp.stack([jnp.ones_like(a), a_1, a_5])
   denominator = jnp.stack([jnp.ones_like(a), -a_1, -a_2, -a_3, -a_4])
-  return numerator, denominator, gain
+  return numerator, denominator, gain, a
 
 
 def _carrier(npts, centre_freq, sample_rate):
@@ -221,11 +237,14 @@ def gammatone_basilar_membrane(
   sincf, coscf = _carrier(reference.shape[0], centre_freq, sample_rate)
 
   def one(signal, bandwidth):
-    numerator, denominator, gain = _gammatone_coefficients(
+    numerator, _, gain, pole = _gammatone_coefficients(
       bandwidth, centre_freq, sample_rate
     )
-    real = filters.lfilter(numerator, denominator, signal * coscf)
-    imaginary = filters.lfilter(numerator, denominator, signal * sincf)
+    # The denominator is a 4th-order repeated pole, which direct form II
+    # cannot represent in float32; cascaded_one_pole keeps the same transfer
+    # function without expanding it.
+    real = filters.cascaded_one_pole(pole, numerator, signal * coscf)
+    imaginary = filters.cascaded_one_pole(pole, numerator, signal * sincf)
     motion = gain * (real * coscf + imaginary * sincf)
     envelope = gain * _safe_sqrt(real * real + imaginary * imaginary)
     return envelope, motion
@@ -380,20 +399,23 @@ def group_delay_compensate(
   erb = _MIN_BANDWIDTH + (jnp.asarray(centre_freq) / _EAR_Q)
   tpt = 2 * np.pi / sample_rate
   a = jnp.exp(-tpt * 1.019 * bandwidths * erb)
-  a_1, a_2, a_3, a_4, a_5 = (
-    4.0 * a,
-    -6.0 * a * a,
-    4.0 * a**3,
-    -(a**4),
-    4.0 * a * a,
-  )
 
-  numerator = jnp.stack([jnp.ones_like(a), a_1, a_5], axis=-1)
-  denominator = jnp.stack([jnp.ones_like(a), -a_1, -a_2, -a_3, -a_4], axis=-1)
-  delays = jax.vmap(filters.group_delay_at_dc)(numerator, denominator)
+  # Closed form of group_delay_at_dc for this filter. The generic expression
+  # divides by sum(denominator), which is (1-a)^4 and cancels to exactly zero
+  # in float32, giving an infinite delay. Both ratios below are exact:
+  #   numerator   [1, 4a, 4a^2]: 4a(1+2a)/(1+2a)^2  =  4a/(1+2a)
+  #   denominator (1 - a z^-1)^4: -4a(1-a)^3/(1-a)^4 = -4a/(1-a)
+  delays = 4.0 * a / (1.0 + 2.0 * a) + 4.0 * a / (1.0 - a)
+
   delays = jnp.round(delays)
   delays = delays - jnp.min(delays)
-  correct = (jnp.max(delays) - delays).astype(jnp.int32)
+  correct = jnp.max(delays) - delays
+  # A non-finite delay casts to INT_MIN silently and misaligns every channel,
+  # which is invisible downstream. Map it to a sentinel instead so a future
+  # regression shows up as an obviously wrong shift rather than as quietly
+  # wrong scores. Under jit an assert cannot fire, so this is the loud option.
+  correct = jnp.where(jnp.isfinite(correct), correct, _BAD_DELAY)
+  correct = correct.astype(jnp.int32)
   return jax.vmap(lambda row, shift: filters.shift_with_zeros(row, -shift))(
     signal, correct
   )
