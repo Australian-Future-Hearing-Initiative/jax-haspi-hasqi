@@ -102,6 +102,7 @@ Deliberate. Each is something a reasonable person would otherwise correct.
 | Unseeded noise | The reference draws Gaussian noise from the global `np.random` in three places, so repeated calls disagree — HASPI by up to 3e-3. |
 | Raises on silence | A silent reference makes `input_align` index an empty array and raise `IndexError`. Recorded as a golden, not smoothed over. |
 | `nbands` scaling | `spectrum_diff` multiplies by the channel count, and `ave_covary2` re-derives centre frequencies from it. Both assume the 32-channel bank. |
+| Short-input scores | Below about 0.5 s of surviving audio HASPI inflates towards 1 and stops being usable: unrelated noise scores about `0.06` at 1 s but about `0.98` at 0.062 s, as medians over seeds at the default `level1`. The cause is the cross-covariance over too few envelope frames, not silence as such — silence only matters because `input_align` crops it and can leave a short record. pyclarity does the same, so this is preserved, not introduced. Guard the duration in the caller. |
 
 ## Noise
 
