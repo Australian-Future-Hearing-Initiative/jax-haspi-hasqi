@@ -179,7 +179,8 @@ readable.
 ## Reference behaviour worth knowing
 
 - Silent reference → `IndexError` from `input_align` indexing an empty
-  threshold-crossing array. Recorded as a golden.
+  threshold-crossing array. Recorded as a golden. The port rejects the same
+  inputs with `ValueError`, so a caller can catch it as an unscoreable clip.
 - Below the cepstral silence threshold, HASPI raises `ValueError` while HASQI
   returns 0.0. The two metrics genuinely differ here.
 - Unseeded RNG draws: 4 per call, in a fixed order. HASPI's are

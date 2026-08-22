@@ -134,6 +134,9 @@ def input_align(reference, processed):
 
   Returns:
     The aligned pair, and the (start, stop, delay) the alignment chose.
+
+  Raises:
+    ValueError: If no reference sample exceeds the silence threshold.
   """
   reference = np.asarray(reference)
   processed = np.asarray(processed)
@@ -155,6 +158,10 @@ def input_align(reference, processed):
     )
 
   above = np.where(np.abs(reference) > 0.001 * np.max(np.abs(reference)))[0]
+  # Upstream indexes this empty and raises IndexError, which callers read as a
+  # bug rather than an unscoreable clip. Same inputs rejected, named cause.
+  if above.size == 0:
+    raise ValueError("reference has no samples above the silence threshold")
   start = above[0]
   stop = min(above[-1], processed_n)
   return (

@@ -211,6 +211,38 @@ def test_input_align_prunes_leading_silence():
   assert len(reference) == len(processed) == 1000
 
 
+def test_input_align_rejects_a_silent_reference():
+  """Upstream indexes an empty array here; the cause is named instead."""
+  silent = np.zeros(2400)
+  with pytest.raises(ValueError, match="silence threshold"):
+    ear_model.input_align(silent, silent)
+
+
+def test_input_align_rejects_a_reference_with_no_finite_peak():
+  """NaN fails the > comparison too, so a non-zero max is not the condition."""
+  reference = np.full(2400, np.nan)
+  with pytest.raises(ValueError, match="silence threshold"):
+    ear_model.input_align(reference, np.ones(2400))
+
+
+def test_input_align_is_bit_identical_on_a_scorable_pair():
+  """The guard must not perturb the alignment it does not reject."""
+  rng = np.random.default_rng(11)
+  reference = np.concatenate((np.zeros(300), rng.standard_normal(4000)))
+  processed = np.concatenate((np.zeros(280), rng.standard_normal(4000)))
+  got_reference, got_processed, meta = ear_model.input_align(
+    reference, processed
+  )
+
+  start, stop, delay = meta
+  assert (start, stop, delay) == (300, 4280, -1203)
+  shifted = np.concatenate(
+    (np.zeros(-delay), processed[: len(processed) + delay])
+  )
+  np.testing.assert_array_equal(got_reference, reference[start : stop + 1])
+  np.testing.assert_array_equal(got_processed, shifted[start : stop + 1])
+
+
 def test_envelope_align_recovers_a_known_shift():
   """Shifting back restores the overlap; the vacated tail stays zero."""
   rng = np.random.default_rng(0)

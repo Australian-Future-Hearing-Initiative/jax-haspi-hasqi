@@ -13,9 +13,11 @@ from jax_haspi_hasqi import neural_net
 # Inherited from ear_model; the HASPI head itself is exact to 1e-15.
 TOLERANCE = 1e-7
 
+# The goldens record upstream's IndexError; the port raises ValueError for the
+# same inputs so a silent clip is catchable as unscoreable. See the README.
 RAISES = {
-  "both_silent": IndexError,
-  "reference_silent": IndexError,
+  "both_silent": ValueError,
+  "reference_silent": ValueError,
   "very_quiet": ValueError,
 }
 
