@@ -100,8 +100,10 @@ Deliberate. Each is something a reasonable person would otherwise correct.
 |---|---|
 | `shift=None` | HASPI v2 documents a `0.02` basal shift of the basilar membrane that is never applied. Upstream [discussed it](https://github.com/claritychallenge/clarity/issues/105) and kept the bug, because every published HASPI number was computed with it. |
 | Unseeded noise | The reference draws Gaussian noise from the global `np.random` in three places, so repeated calls disagree — HASPI by up to 3e-3. |
-| Raises on silence | A silent reference has nothing above the threshold `input_align` prunes to, so the pair cannot be aligned and no score exists. Preserved: it still raises, and still on exactly the inputs upstream fails on. The one divergence in this table — upstream reaches this by indexing an empty array and raising `IndexError`, which reads as a bug in the port rather than an unscoreable clip, so this raises `ValueError` naming the cause. No score changes; the goldens still record upstream's `IndexError`. |
+| Raises on silence | A silent reference has nothing above the threshold `input_align` prunes to, so the pair cannot be aligned and no score exists. Preserved: it still raises, and still on exactly the inputs upstream fails on. A divergence in this table — upstream reaches this by indexing an empty array and raising `IndexError`, which reads as a bug in the port rather than an unscoreable clip, so this raises `ValueError` naming the cause. No score changes; the goldens still record upstream's `IndexError`. |
 | `nbands` scaling | `spectrum_diff` multiplies by the channel count, and `ave_covary2` re-derives centre frequencies from it. Both assume the 32-channel bank. |
+| `group_delay_compensate` | The processed signal is aligned using the reference signal's filter-bank bandwidths rather than its own, matching pyclarity's behavior. |
+| Short-signal (192–383 samples) | Deliberate divergence: signals between 192 and 383 samples raise an error in pyclarity due to degenerate envelope/segment frames, while `jax-haspi-hasqi` returns a valid score. |
 | Short-input scores | Below about 0.5 s of surviving audio HASPI inflates towards 1 and stops being usable: unrelated noise scores about `0.06` at 1 s but about `0.98` at 0.062 s, as medians over seeds at the default `level1`. The cause is the cross-covariance over too few envelope frames, not silence as such — silence only matters because `input_align` crops it and can leave a short record. pyclarity does the same, so this is preserved, not introduced. Guard the duration in the caller. |
 
 ## Noise
@@ -130,9 +132,13 @@ still counting it in the average, and any noise at all lifts it off zero.
 | `speech_snr20` | HASQI | 0.2558208 | 0.2675992 | 1.4e-03 | **−1.2e-02** |
 | `speech_snr5` | HASPI | 0.9989436 | 0.9989102 | 2.2e-04 | +3.3e-05 |
 
-So report a HASQI figure from this package as the deterministic noise-free
-variant, not as a plain pyclarity HASQI v2 number. Use the `seeded` goldens if
-you need exact parity.
+When reporting scores computed with this package, cite the exact variant:
+
+- `"HASQI v2 (pyclarity 0.9.0 algorithm, deterministic noise-free variant)"`
+- `"HASPI v2 (pyclarity 0.9.0 algorithm, deterministic noise-free variant)"`
+
+Do not report them as plain pyclarity numbers. Use the `seeded` goldens if you
+need exact parity.
 
 ## Regenerating the goldens
 

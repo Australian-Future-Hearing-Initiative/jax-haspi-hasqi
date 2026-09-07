@@ -639,7 +639,9 @@ def ear_model(
     reference_rate: Its sampling rate in Hz.
     processed: Processed signal, assumed to have equal or greater group delay.
     processed_rate: Its sampling rate in Hz.
-    hearing_loss: Levels in dB at [250, 500, 1000, 2000, 4000, 6000] Hz.
+    hearing_loss: Audiometric thresholds in dB HL at [250, 500, 1000, 2000,
+      4000, 6000] Hz. The caller must resample/interpolate other frequencies to
+      these six values before calling.
     itype: 0 intelligibility, 1 quality with NAL-R added here, 2 quality with
       NAL-R already applied to the reference.
     level1: dB SPL corresponding to an RMS of 1.

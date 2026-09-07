@@ -58,12 +58,17 @@ def haspi_v2(
   filter bank leaves no choice. Passing float32 inputs is fine and costs about
   2e-09 against a native float64 run.
 
+  When citing scores from this function, use:
+    "HASPI v2 (pyclarity 0.9.0 algorithm, deterministic noise-free variant)"
+
   Args:
     reference: Clean reference signal, without amplification.
     reference_rate: Its sampling rate in Hz.
     processed: Processed signal.
     processed_rate: Its sampling rate in Hz.
-    hearing_loss: Levels in dB at [250, 500, 1000, 2000, 4000, 6000] Hz.
+    hearing_loss: Audiometric thresholds in dB HL at [250, 500, 1000, 2000,
+      4000, 6000] Hz. The caller must resample/interpolate other frequencies to
+      these six values before calling (e.g. log-frequency interpolation).
     level1: dB SPL corresponding to an RMS of 1.
     f_lp: Envelope low-pass cutoff in Hz.
     itype: Passed to the ear model; 0 for intelligibility.

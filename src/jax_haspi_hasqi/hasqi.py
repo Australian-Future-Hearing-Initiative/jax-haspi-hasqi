@@ -386,12 +386,21 @@ def hasqi_v2(
   filter bank leaves no choice. Passing float32 inputs is fine and costs about
   2e-09 against a native float64 run.
 
+  When citing scores from this function, use:
+    "HASQI v2 (pyclarity 0.9.0 algorithm, deterministic noise-free variant)"
+
+  Note on noise-free bias: The default noise-free execution introduces a
+  measured negative bias (-1.4e-02 on speech_snr5) compared to stochastic
+  pyclarity means due to zero-BM-motion tile revival in bm_covary.
+
   Args:
     reference: Clean reference signal.
     reference_rate: Its sampling rate in Hz.
     processed: Processed signal.
     processed_rate: Its sampling rate in Hz.
-    hearing_loss: Levels in dB at [250, 500, 1000, 2000, 4000, 6000] Hz.
+    hearing_loss: Audiometric thresholds in dB HL at [250, 500, 1000, 2000,
+      4000, 6000] Hz. The caller must resample/interpolate other frequencies to
+      these six values before calling (e.g. log-frequency interpolation).
     equalisation: 1 to apply NAL-R to the reference here, 2 if it already has it.
     level1: dB SPL corresponding to an RMS of 1.
     silence_threshold: dB SL below which a time-frequency tile is ignored.
