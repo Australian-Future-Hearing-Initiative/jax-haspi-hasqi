@@ -147,6 +147,31 @@ def test_ave_covary_ignores_tiles_below_threshold():
   assert not np.any(np.asarray(sync))
 
 
+def test_ave_covary_non_uniform_channels_matches_expected_sync():
+  """Sync covariance exercises all filter orders and cutoffs across channels."""
+  cross_covariance = jnp.asarray(
+    np.repeat(np.arange(32)[:, None], 10, axis=1), dtype=jnp.float64
+  )
+  rms = jnp.full((32, 10), 100.0, dtype=jnp.float64)
+
+  # Compute unweighted average and synchronisation covariances.
+  average, sync = hasqi.ave_covary2(cross_covariance, rms)
+
+  # Assert average and exact expected sync covariance across the 6 filter orders.
+  assert float(average) == pytest.approx(15.5)
+  expected_sync = np.array(
+    [
+      11.660278698686529,
+      10.385608193019019,
+      10.762955820363286,
+      11.553436894211385,
+      12.224517586882122,
+      12.803626371674067,
+    ]
+  )
+  np.testing.assert_allclose(np.asarray(sync), expected_sync, rtol=1e-7)
+
+
 def test_back_end_stages_are_jittable():
   envelope = jnp.asarray(
     np.abs(np.random.default_rng(0).standard_normal((32, 6000))) * 40

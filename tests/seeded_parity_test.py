@@ -9,8 +9,20 @@ from jax_haspi_hasqi import hasqi
 
 TOLERANCE = 1e-8
 
-HASPI_CASES = ("tone_snr20", "audiogram_clinical", "processed_silent")
-HASQI_CASES = ("tone_snr20", "audiogram_clinical", "scaled_half")
+HASPI_CASES = (
+  "tone_snr20",
+  "audiogram_clinical",
+  "processed_silent",
+  "speech_snr5",
+  "speech_snr20",
+)
+HASQI_CASES = (
+  "tone_snr20",
+  "audiogram_clinical",
+  "scaled_half",
+  "speech_snr5",
+  "speech_snr20",
+)
 
 
 def recorded_draws(case, metric):
