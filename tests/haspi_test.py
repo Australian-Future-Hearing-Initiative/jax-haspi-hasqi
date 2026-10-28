@@ -13,13 +13,8 @@ from jax_haspi_hasqi import neural_net
 # Inherited from ear_model; the HASPI head itself is exact to 1e-15.
 TOLERANCE = 1e-7
 
-# The goldens record upstream's IndexError; the port raises ValueError for the
-# same inputs so a silent clip is catchable as unscoreable. See the README.
-RAISES = {
-  "both_silent": ValueError,
-  "reference_silent": ValueError,
-  "very_quiet": ValueError,
-}
+# Silent references return 0.0 so the pipeline stays static-shape in JAX.
+SILENT = {"both_silent", "reference_silent", "very_quiet"}
 
 # The signal is fully masked, so the reference's dither is the only thing left
 # to correlate. Noise-free the ten raw correlations are exactly zero and the
@@ -42,7 +37,7 @@ def score(case):
 
 
 def scorable():
-  return [c for c in goldens.cases() if c.name not in RAISES]
+  return [c for c in goldens.cases() if c.name not in SILENT]
 
 
 @pytest.mark.parametrize("case", scorable(), ids=lambda c: c.name)
@@ -52,11 +47,20 @@ def test_matches_the_reference(case):
   )
 
 
-@pytest.mark.parametrize("name", sorted(RAISES))
-def test_raises_where_the_reference_raises(name):
+@pytest.mark.parametrize("name", sorted(SILENT))
+def test_silent_cases_score_zero(name):
   case = goldens.case(name)
-  with pytest.raises(RAISES[name]):
-    score(case)
+  got_score, correlations = haspi.haspi_v2(
+    case.reference,
+    case.reference_sample_rate,
+    case.processed,
+    case.processed_sample_rate,
+    case.levels,
+    level1=case.level1,
+    itype=case.itype,
+  )
+  assert float(got_score) == 0.0
+  np.testing.assert_array_equal(np.asarray(correlations), np.zeros(10))
 
 
 @pytest.mark.parametrize("name", sorted(DITHER_DOMINATED))
@@ -146,21 +150,28 @@ def test_modulation_bands_are_dropped_above_nyquist():
   assert len(narrow) < 10
 
 
-def test_cepstral_gate_raises_below_threshold():
+def test_cepstral_gate_zeros_below_threshold():
   quiet = np.full((100, 32), -100.0)
-  with pytest.raises(ValueError, match="below threshold"):
-    modulation.cepstral_correlation_coef(quiet, quiet, 2.5, 0.1, 6)
+  reference_cep, processed_cep, nkept = modulation.cepstral_correlation_coef(
+    quiet, quiet, 2.5, 0.1, 6
+  )
+  assert int(nkept) == 0
+  np.testing.assert_array_equal(np.asarray(reference_cep), np.zeros((100, 6)))
+  np.testing.assert_array_equal(np.asarray(processed_cep), np.zeros((100, 6)))
 
 
 def test_cepstral_gate_drops_silent_samples():
-  """The kept-sample count is data-dependent, which is why this stays numpy."""
+  """Active frames are compacted into [:nkept] while keeping a static shape."""
   envelope = np.full((100, 32), 40.0)
   envelope[:40] = -100.0
-  reference_cep, processed_cep = modulation.cepstral_correlation_coef(
+  reference_cep, processed_cep, nkept = modulation.cepstral_correlation_coef(
     envelope, envelope, 2.5, 0.1, 6
   )
-  assert reference_cep.shape == (60, 6)
-  assert processed_cep.shape == (60, 6)
+  assert int(nkept) == 60
+  assert reference_cep.shape == (100, 6)
+  assert processed_cep.shape == (100, 6)
+  np.testing.assert_array_equal(np.asarray(reference_cep[60:]), 0.0)
+  np.testing.assert_array_equal(np.asarray(processed_cep[60:]), 0.0)
 
 
 def test_cross_correlation_is_one_for_identical_input():
@@ -181,6 +192,34 @@ def test_filterbank_and_network_are_jittable():
   assert isinstance(
     jax.jit(neural_net.intelligibility)(jnp.ones(10)), jax.Array
   )
+
+
+def test_haspi_v2_is_jittable_without_recompilation():
+  """Clips of equal length with different silence fractions share one XLA binary."""
+  jitted = jax.jit(
+    haspi.haspi_v2,
+    static_argnames=("reference_rate", "processed_rate", "f_lp", "itype"),
+  )
+  case_a = goldens.case("speech_snr20")
+  case_b = goldens.case("both_silent")
+  assert case_a.reference.shape == case_b.reference.shape
+  score_a, _ = jitted(
+    jnp.asarray(case_a.reference),
+    case_a.reference_sample_rate,
+    jnp.asarray(case_a.processed),
+    case_a.processed_sample_rate,
+    jnp.asarray(case_a.levels),
+  )
+  score_b, _ = jitted(
+    jnp.asarray(case_b.reference),
+    case_b.reference_sample_rate,
+    jnp.asarray(case_b.processed),
+    case_b.processed_sample_rate,
+    jnp.asarray(case_b.levels),
+  )
+  assert float(score_a) == pytest.approx(case_a.score("haspi"), rel=TOLERANCE)
+  assert float(score_b) == 0.0
+  assert jitted._cache_size() == 1
 
 
 def test_network_is_differentiable():

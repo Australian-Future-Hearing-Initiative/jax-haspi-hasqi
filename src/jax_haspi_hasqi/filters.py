@@ -220,6 +220,7 @@ def shift_with_zeros(x, delay):
   slice, so `delay` may be a traced value.
   """
   npts = x.shape[0]
+  delay = jnp.clip(delay, -npts, npts)
   padded = jnp.concatenate(
     [jnp.zeros(npts, x.dtype), x, jnp.zeros(npts, x.dtype)]
   )

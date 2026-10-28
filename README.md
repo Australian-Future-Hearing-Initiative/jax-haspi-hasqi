@@ -44,10 +44,11 @@ silent and can reach 10 dB in the top band.
 
 ### Performance
 
-Both metrics are `jit`-compiled internally, so the first call for a given
-signal shape pays compilation and later calls with that shape do not. Measured
-on 12 mixed-length pairs, scoring both metrics, against pyclarity on the same
-signals:
+Both metrics are pure static-shape JAX and `jit`-compiled internally, so the
+first call for a given input waveform length pays compilation and later calls
+with that length do not — regardless of how much leading, trailing, or internal
+silence each clip contains. Measured on 12 mixed-length pairs, scoring both
+metrics, against pyclarity on the same signals:
 
 | | s/pair |
 |---|---|
@@ -55,22 +56,13 @@ signals:
 | **steady state** | **0.39** |
 | pyclarity | 1.66 |
 
-**4.2× faster than the reference** once warm. The shapes that drive
-recompilation — the aligned length, the HASQI segment count, the HASPI
-cepstral-gate count — all depend on the *reference* signal, not the processed
-one, so a fixed validation set compiles once and stays warm as the model under
-test changes. Across epochs holding the references fixed, all three were
-invariant.
+**4.2× faster than the reference** once warm. Because `input_align` and the
+HASPI cepstral silence gate compact active samples into the front of
+fixed-length arrays rather than cropping to data-dependent shapes, clips of the
+same length never trigger XLA recompilation and both `haspi_v2` and `hasqi_v2`
+can be wrapped directly in an outer `jax.jit`.
 
 Set `jax_compilation_cache_dir` to carry compilation across processes.
-
-> [!NOTE]
-> Not differentiable, and not `jit`-able from outside. `input_align` and the
-> cepstral gate crop to data-dependent shapes in numpy, which a tracer cannot
-> pass through; `jax.grad` and an enclosing `jax.jit` both raise
-> `TracerArrayConversionError`. These are reporting metrics, not losses. The
-> alignment stages that resist differentiation are exactly the ones a faithful
-> port has to keep.
 
 ## What it is faithful to
 
@@ -91,7 +83,7 @@ Deliberate. Each is something a reasonable person would otherwise correct.
 |---|---|
 | `shift=None` | HASPI v2 documents a `0.02` basal shift of the basilar membrane that is never applied. Upstream [discussed it](https://github.com/claritychallenge/clarity/issues/105) and kept the bug, because every published HASPI number was computed with it. |
 | Unseeded noise | The reference draws Gaussian noise from the global `np.random` in three places, so repeated calls disagree — HASPI by up to 3e-3. |
-| Raises on silence | A silent reference has nothing above the threshold `input_align` prunes to, so the pair cannot be aligned and no score exists. Preserved: it still raises, and still on exactly the inputs upstream fails on. A divergence in this table — upstream reaches this by indexing an empty array and raising `IndexError`, which reads as a bug in the port rather than an unscoreable clip, so this raises `ValueError` naming the cause. No score changes; the goldens still record upstream's `IndexError`. |
+| Zero on silence | When a reference clip has no samples above the silence threshold (`both_silent`, `reference_silent`, `very_quiet`), upstream raises `IndexError` or `ValueError`. To execute inside static-shape XLA graphs without data-dependent host branches, both metrics return `0.0` (matching HASQI's existing behaviour on `very_quiet`, `processed_silent`, and `audiogram_severe`). |
 | `nbands` scaling | `spectrum_diff` multiplies by the channel count, and `ave_covary2` re-derives centre frequencies from it. Both assume the 32-channel bank. |
 | `group_delay_compensate` | The processed signal is aligned using the reference signal's filter-bank bandwidths rather than its own, matching pyclarity's behavior. |
 | Short-signal (192–383 samples) | Deliberate divergence: signals between 192 and 383 samples raise an error in pyclarity due to degenerate envelope/segment frames, while `jax-haspi-hasqi` returns a valid score. |

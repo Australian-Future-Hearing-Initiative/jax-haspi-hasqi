@@ -56,7 +56,13 @@ def test_identical_without_equalisation_is_the_ceiling():
 
 
 def test_silence_scores_zero():
-  for name in ("processed_silent", "very_quiet", "audiogram_severe"):
+  for name in (
+    "both_silent",
+    "reference_silent",
+    "processed_silent",
+    "very_quiet",
+    "audiogram_severe",
+  ):
     assert score(goldens.case(name)) == 0.0
 
 
@@ -183,3 +189,37 @@ def test_back_end_stages_are_jittable():
     jax.jit(hasqi.mel_cepstrum_correlation)(smoothed, smoothed)[0], jax.Array
   )
   assert isinstance(jax.jit(hasqi.bm_covary)(motion, motion)[0], jax.Array)
+
+
+def test_hasqi_v2_is_jittable_without_recompilation():
+  """Clips of equal length with different silence fractions share one XLA binary."""
+  jitted = jax.jit(
+    hasqi.hasqi_v2,
+    static_argnames=(
+      "reference_rate",
+      "processed_rate",
+      "equalisation",
+      "silence_threshold",
+      "segment_covariance",
+    ),
+  )
+  case_a = goldens.case("speech_snr20")
+  case_b = goldens.case("both_silent")
+  assert case_a.reference.shape == case_b.reference.shape
+  score_a, *_ = jitted(
+    jnp.asarray(case_a.reference),
+    case_a.reference_sample_rate,
+    jnp.asarray(case_a.processed),
+    case_a.processed_sample_rate,
+    jnp.asarray(case_a.levels),
+  )
+  score_b, *_ = jitted(
+    jnp.asarray(case_b.reference),
+    case_b.reference_sample_rate,
+    jnp.asarray(case_b.processed),
+    case_b.processed_sample_rate,
+    jnp.asarray(case_b.levels),
+  )
+  assert float(score_a) == pytest.approx(case_a.score("hasqi"), rel=TOLERANCE)
+  assert float(score_b) == 0.0
+  assert jitted._cache_size() == 1
