@@ -140,10 +140,11 @@ def group_delay_at_dc(b, a):
   The closed form avoids scipy's FFT path; verified to agree to 6e-10 on the
   gammatone coefficients this is used with.
   """
-  b = jnp.asarray(b)
-  a = jnp.asarray(a)
-  kb = jnp.arange(len(b), dtype=b.dtype)
-  ka = jnp.arange(len(a), dtype=a.dtype)
+  dtype = jnp.result_type(b, a, jnp.float32)
+  b = jnp.asarray(b, dtype=dtype)
+  a = jnp.asarray(a, dtype=dtype)
+  kb = jnp.arange(len(b), dtype=dtype)
+  ka = jnp.arange(len(a), dtype=dtype)
   return jnp.sum(kb * b) / jnp.sum(b) - jnp.sum(ka * a) / jnp.sum(a)
 
 

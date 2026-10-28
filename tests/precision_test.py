@@ -1,9 +1,10 @@
-"""Precision policy: float64 internally, whatever the caller has configured."""
+"""Precision policy: respect input/caller dtype (float32 or float64)."""
 
 import subprocess
 import sys
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -14,8 +15,7 @@ from jax_haspi_hasqi import precision
 SR = 24000
 LEVELS = np.array([21.0, 26.0, 30.0, 32.0, 33.0, 33.0])
 
-# conftest enables x64 process-wide, so the float32 path can only be exercised
-# honestly in a fresh interpreter.
+# conftest enables x64, so default float32 runs in a fresh interpreter.
 _FLOAT32_SCRIPT = """
 import jax
 import jax.numpy as jnp
@@ -40,8 +40,8 @@ quality, *_ = hasqi.hasqi_v2(
 )
 after = jnp.zeros(1).dtype
 
-print(f"HASPI {float(score):.9f}")
-print(f"HASQI {float(quality):.9f}")
+print(f"HASPI {float(score):.9f} {score.dtype}")
+print(f"HASQI {float(quality):.9f} {quality.dtype}")
 print(f"DTYPE {before} {after}")
 """
 
@@ -56,8 +56,7 @@ def _signals(n=12000, seed=3):
 
 
 def test_float32_process_gets_a_score_not_an_exception():
-  """A float32 caller used to get a NaN from HASQI and a misleading
-  'Signal below threshold' from HASPI. Now it gets the float64 answer."""
+  """A float32 caller runs natively in float32 without NaN or exception."""
   result = subprocess.run(
     [sys.executable, "-c", _FLOAT32_SCRIPT],
     capture_output=True,
@@ -67,17 +66,39 @@ def test_float32_process_gets_a_score_not_an_exception():
   lines = dict(
     line.split(" ", 1) for line in result.stdout.strip().splitlines()
   )
-  got_haspi = float(lines["HASPI"])
-  got_hasqi = float(lines["HASQI"])
+  haspi_val, haspi_dtype = lines["HASPI"].split()
+  hasqi_val, hasqi_dtype = lines["HASQI"].split()
+  got_haspi = float(haspi_val)
+  got_hasqi = float(hasqi_val)
+  assert haspi_dtype == "float32"
+  assert hasqi_dtype == "float32"
 
   ref, proc = _signals()
   want_haspi = float(haspi.haspi_v2(ref, SR, proc, SR, LEVELS)[0])
   want_hasqi = float(hasqi.hasqi_v2(ref, SR, proc, SR, LEVELS)[0])
 
-  # float32 inputs carry ~1e-7 of their own, so this is agreement on the
-  # computation, not on the inputs.
-  assert abs(got_haspi - want_haspi) < 1e-6
-  assert abs(got_hasqi - want_hasqi) < 1e-6
+  assert abs(got_haspi - want_haspi) < 1e-3
+  assert abs(got_hasqi - want_hasqi) < 1e-3
+
+
+def test_input_dtype_is_preserved_when_x64_is_enabled():
+  """Under jax_enable_x64, float32 inputs run in float32 and float64 in float64."""
+  ref, proc = _signals()
+  score32, corr32 = haspi.haspi_v2(
+    jnp.float32(ref), SR, jnp.float32(proc), SR, jnp.float32(LEVELS)
+  )
+  qual32, _, _, raw32 = hasqi.hasqi_v2(
+    jnp.float32(ref), SR, jnp.float32(proc), SR, jnp.float32(LEVELS)
+  )
+  assert score32.dtype == corr32.dtype == jnp.float32
+  assert qual32.dtype == raw32.dtype == jnp.float32
+
+  score64, corr64 = haspi.haspi_v2(ref, SR, proc, SR, LEVELS)
+  qual64, _, _, raw64 = hasqi.hasqi_v2(ref, SR, proc, SR, LEVELS)
+  assert score64.dtype == corr64.dtype == jnp.float64
+  assert qual64.dtype == raw64.dtype == jnp.float64
+  assert abs(float(score32) - float(score64)) < 1e-3
+  assert abs(float(qual32) - float(qual64)) < 1e-3
 
 
 def test_the_callers_dtype_is_restored():

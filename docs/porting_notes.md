@@ -61,8 +61,12 @@ This is scan-versus-`scipy.lfilter` accumulation order, not an algorithmic
 difference: feeding both the same coefficients on the same input gives 5e-13,
 and the error grows only through the cascade.
 
-**float64 is required.** In float32 the same recursion has 7.6e-02 relative
-error, which is not a metric. `tests/conftest.py` enables x64.
+**float64 vs float32.** Using the factored 4th-order one-pole cascade
+(`filters.cascaded_one_pole`) and closed-form group delay, `float32` runs
+cleanly within ~6e-03 relative on HASPI and ~1.3e-02 relative on HASQI, while
+`float64` (`jax_enable_x64`) achieves 2.8e-08 relative. `tests/conftest.py`
+enables x64 so the golden suite checks exact reference parity, while
+`tests/precision_test.py` tests both `float32` and `float64` execution.
 
 ## Differentiability, such as it is
 

@@ -51,33 +51,35 @@ def _fir2(order, frequencies, gains, n_interpolate=512):
   index arithmetic is static and only the gains flow through the graph.
   """
   length = order + 1
-  window = jnp.asarray(scipy.signal.windows.hamming(length))
-  gains = jnp.asarray(gains)
+  dtype = jnp.result_type(gains, jnp.float32)
+  gains = jnp.asarray(gains, dtype=dtype)
+  window = jnp.asarray(scipy.signal.windows.hamming(length), dtype=dtype)
 
   frequencies = np.asarray(frequencies, dtype=np.float64).copy()
   frequencies[0] = 0.0
   frequencies[-1] = 1.0
-  lap = int(np.fix(n_interpolate / 25))
+  lap = int(np.trunc(n_interpolate / 25))
   grid_len = n_interpolate + 1
 
-  response = jnp.zeros(grid_len, gains.dtype).at[0].set(gains[0])
+  response = jnp.zeros(grid_len, dtype=dtype).at[0].set(gains[0])
   start = 0
   for i in range(len(frequencies) - 1):
     if frequencies[i + 1] == frequencies[i]:
       start = int(np.ceil(start - lap / 2))
       end = start + lap - 1
     else:
-      end = int(np.fix(frequencies[i + 1] * grid_len)) - 1
+      end = int(np.trunc(frequencies[i + 1] * grid_len)) - 1
     index = np.arange(start, end + 1)
-    ramp = (
-      np.zeros(len(index)) if start == end else (index - start) / (end - start)
+    ramp = jnp.asarray(
+      np.zeros(len(index)) if start == end else (index - start) / (end - start),
+      dtype=dtype,
     )
     response = response.at[index].set(
       ramp * gains[i + 1] + (1 - ramp) * gains[i]
     )
     start = end + 1
 
-  transform = jnp.asarray(_inverse_transform(length, grid_len), response.dtype)
+  transform = jnp.asarray(_inverse_transform(length, grid_len), dtype=dtype)
 
   return (transform @ response) * window
 
@@ -90,9 +92,10 @@ def build(hearing_loss, n_fir=140, sample_rate=24000.0):
     n_fir: Filter order.
     sample_rate: Sampling rate in Hz.
   """
-  hearing_loss = jnp.asarray(hearing_loss)
+  dtype = jnp.result_type(hearing_loss, jnp.float32)
+  hearing_loss = jnp.asarray(hearing_loss, dtype=dtype)
   nyquist = 0.5 * sample_rate
-  delay = jnp.zeros(n_fir + 1).at[n_fir // 2].set(1.0)
+  delay = jnp.zeros(n_fir + 1, dtype=dtype).at[n_fir // 2].set(1.0)
 
   critical_loss = hearing_loss[1] + hearing_loss[2] + hearing_loss[3]
   x_ave = jnp.where(
@@ -100,14 +103,22 @@ def build(hearing_loss, n_fir=140, sample_rate=24000.0):
     0.05 * critical_loss,
     9.0 + 0.116 * (critical_loss - 180),
   )
-  gain_db = jnp.clip(x_ave + 0.31 * hearing_loss + _BIAS, 0.0, None)
+  bias = jnp.asarray(_BIAS, dtype=dtype)
+  gain_db = jnp.clip(x_ave + 0.31 * hearing_loss + bias, 0.0, None)
 
   # Interpolate the gains onto a uniform grid, extending flat past the ends.
-  grid = np.linspace(0, n_fir, n_fir + 1) / n_fir
-  knots = np.concatenate(([0.0], NALR_FREQUENCIES, [nyquist]))
+  grid_np = np.linspace(0, n_fir, n_fir + 1) / n_fir
+  grid = jnp.asarray(grid_np, dtype=dtype)
+  knots = jnp.asarray(
+    np.concatenate(([0.0], NALR_FREQUENCIES, [nyquist])), dtype=dtype
+  )
   knot_gains = jnp.concatenate((gain_db[:1], gain_db, gain_db[-1:]))
-  interpolated = jnp.interp(nyquist * grid, jnp.asarray(knots), knot_gains)
-  nalr = _fir2(n_fir, grid, jnp.power(10.0, interpolated / 20.0))
+  interpolated = jnp.interp(nyquist * grid, knots, knot_gains)
+  nalr = _fir2(
+    n_fir,
+    grid_np,
+    jnp.power(jnp.asarray(10.0, dtype=dtype), interpolated / 20.0),
+  )
 
   # A flat audiogram needs no gain, and the reference returns the delay itself.
   return jnp.where(jnp.max(hearing_loss) > 0, nalr, delay), delay
