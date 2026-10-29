@@ -8,7 +8,6 @@ import jax.numpy as jnp
 from jax_haspi_hasqi import ear_model
 from jax_haspi_hasqi import modulation
 from jax_haspi_hasqi import neural_net
-from jax_haspi_hasqi import precision
 
 _LOW_PASS_CUTOFF = 320.0
 _CEPSTRAL_BASIS = 6
@@ -37,7 +36,6 @@ def _haspi_backend(reference_cep, processed_cep, freq_sub_sample):
   return neural_net.intelligibility(correlations), correlations
 
 
-@precision.in_float64
 def haspi_v2(
   reference,
   reference_rate,
@@ -53,10 +51,9 @@ def haspi_v2(
 ):
   """HASPI version 2 intelligibility index.
 
-  Runs in float64 regardless of the caller's JAX configuration, and restores
-  that configuration afterwards; see jax_haspi_hasqi.precision for why the
-  filter bank leaves no choice. Passing float32 inputs is fine and costs about
-  2e-09 against a native float64 run.
+  Runs in the floating-point precision of ``reference`` and ``processed``
+  (``float32`` by default, or ``float64`` when ``jax_enable_x64`` is enabled
+  and inputs are ``float64``).
 
   When citing scores from this function, use:
     "HASPI v2 (pyclarity 0.9.0 algorithm, deterministic noise-free variant)"

@@ -8,7 +8,6 @@ import numpy as np
 
 from jax_haspi_hasqi import ear_model
 from jax_haspi_hasqi import filters
-from jax_haspi_hasqi import precision
 
 _SMALL = 1e-30
 _SILENCE_THRESHOLD = 2.5
@@ -62,13 +61,15 @@ def env_smooth(
     segment_size: Averaging segment in ms.
     sample_rate: Envelope sampling rate in Hz.
   """
+  dtype = jnp.result_type(envelopes, jnp.float32)
+  envelopes = jnp.asarray(envelopes, dtype=dtype)
   nwin = int(np.around(segment_size * (0.001 * sample_rate)))
   nwin += nwin % 2
   nhalf = nwin // 2
 
-  window = np.hanning(nwin)
-  window_sum = np.sum(window)
-  half_sum = np.sum(window[nhalf:nwin])
+  window = jnp.asarray(np.hanning(nwin), dtype=dtype)
+  window_sum = jnp.sum(window)
+  half_sum = jnp.sum(window[nhalf:nwin])
 
   starts, nseg = _segment_layout(envelopes.shape[1], nwin)
 
@@ -110,22 +111,30 @@ def mel_cepstrum_correlation(
   Returns:
     The average cepstral correlation and the six individual ones.
   """
+  dtype = jnp.result_type(reference, distorted, jnp.float32)
+  reference = jnp.asarray(reference, dtype=dtype)
+  distorted = jnp.asarray(distorted, dtype=dtype)
   nbands = reference.shape[0]
-  basis = jnp.asarray(_mel_cepstrum_basis(nbands))
+  basis = jnp.asarray(_mel_cepstrum_basis(nbands), dtype=dtype)
 
-  loudness = jnp.sum(jnp.power(10.0, reference / 20), axis=0) / nbands
-  loudness = 20 * jnp.log10(loudness)
+  loudness = (
+    jnp.sum(jnp.power(dtype.type(10.0), reference / 20), axis=0) / nbands
+  )
+  loudness = 20 * jnp.log10(jnp.maximum(loudness, dtype.type(_SMALL)))
   keep = loudness > threshold
   nsamp = jnp.sum(keep)
+  zero = jnp.zeros((), dtype=dtype)
+  one = jnp.ones((), dtype=dtype)
+  denom = jnp.maximum(nsamp, 1).astype(dtype)
 
   if noise is not None:
-    reference = reference + noise[0]
-    distorted = distorted + noise[1]
+    reference = reference + jnp.asarray(noise[0], dtype=dtype)
+    distorted = distorted + jnp.asarray(noise[1], dtype=dtype)
 
   def cepstra(envelope):
-    coefficients = basis.T @ jnp.where(keep, envelope, 0.0)
-    mean = jnp.sum(coefficients, axis=1, keepdims=True) / jnp.maximum(nsamp, 1)
-    return jnp.where(keep, coefficients - mean, 0.0)
+    coefficients = basis.T @ jnp.where(keep, envelope, zero)
+    mean = jnp.sum(coefficients, axis=1, keepdims=True) / denom
+    return jnp.where(keep, coefficients - mean, zero)
 
   reference_cep = cepstra(reference)
   distorted_cep = cepstra(distorted)
@@ -136,14 +145,14 @@ def mel_cepstrum_correlation(
   correlations = jnp.where(
     valid,
     jnp.abs(jnp.sum(reference_cep * distorted_cep, axis=1))
-    / jnp.sqrt(jnp.where(valid, reference_sum * distorted_sum, 1.0)),
-    0.0,
+    / jnp.sqrt(jnp.where(valid, reference_sum * distorted_sum, one)),
+    zero,
   )
 
   average = jnp.sum(correlations[1:]) / (_CEPSTRAL_COEFFICIENTS - 1)
   # The reference bails out and returns zeros when nothing clears threshold.
   enough = nsamp > 1
-  return jnp.where(enough, average, 0.0), jnp.where(enough, correlations, 0.0)
+  return jnp.where(enough, average, zero), jnp.where(enough, correlations, zero)
 
 
 def spectrum_diff(reference_sl, processed_sl):
@@ -152,9 +161,12 @@ def spectrum_diff(reference_sl, processed_sl):
   Returns:
     [sum abs, std, max] for the spectrum, the normalised spectrum and the slope.
   """
+  dtype = jnp.result_type(reference_sl, processed_sl, jnp.float32)
+  reference_sl = jnp.asarray(reference_sl, dtype=dtype)
+  processed_sl = jnp.asarray(processed_sl, dtype=dtype)
   nbands = reference_sl.shape[0]
-  reference = jnp.power(10.0, reference_sl / 20)
-  processed = jnp.power(10.0, processed_sl / 20)
+  reference = jnp.power(dtype.type(10.0), reference_sl / 20)
+  processed = jnp.power(dtype.type(10.0), processed_sl / 20)
   reference = reference / jnp.sum(reference)
   processed = processed / jnp.sum(processed)
 
@@ -184,25 +196,34 @@ def bm_covary(
   Returns:
     The cross-covariance and the two mean-square levels, each (nchan, nseg).
   """
+  dtype = jnp.result_type(reference_bm, processed_bm, jnp.float32)
+  reference_bm = jnp.asarray(reference_bm, dtype=dtype)
+  processed_bm = jnp.asarray(processed_bm, dtype=dtype)
   max_lag = int(np.around(1.0 * (0.001 * sample_rate)))
   nwin = int(np.around(segment_size * (0.001 * sample_rate)))
   nwin += nwin % 2 == 1
   nhalf = nwin // 2
 
-  window = np.hanning(nwin)
-  half_window = window[nhalf:nwin]
+  window_np = np.hanning(nwin)
+  half_window_np = window_np[nhalf:nwin]
 
   def inverse_window_correlation(values):
     correlation = np.correlate(values, values, "full")
     start = len(values) - 1 - max_lag
     if start < 0:
       raise ValueError("segment size too small")
-    return jnp.asarray(1 / correlation[start : max_lag + len(values)])
+    return jnp.asarray(
+      1 / correlation[start : max_lag + len(values)], dtype=dtype
+    )
 
-  window_correlation = inverse_window_correlation(window)
-  half_correlation = inverse_window_correlation(half_window)
-  window_power = 1.0 / np.sum(window**2)
-  half_power = 1.0 / np.sum(half_window**2)
+  window_correlation = inverse_window_correlation(window_np)
+  half_correlation = inverse_window_correlation(half_window_np)
+  window_power = dtype.type(1.0 / np.sum(window_np**2))
+  half_power = dtype.type(1.0 / np.sum(half_window_np**2))
+  window = jnp.asarray(window_np, dtype=dtype)
+  half_window = jnp.asarray(half_window_np, dtype=dtype)
+  zero = jnp.zeros((), dtype=dtype)
+  one = jnp.ones((), dtype=dtype)
 
   npts = reference_bm.shape[1]
   starts, nseg = _segment_layout(npts, nwin)
@@ -228,8 +249,8 @@ def bm_covary(
     valid = (reference_ms > _SMALL) & (processed_ms > _SMALL)
     covariance = jnp.where(
       valid,
-      peak / jnp.sqrt(jnp.where(valid, reference_ms * processed_ms, 1.0)),
-      0.0,
+      peak / jnp.sqrt(jnp.where(valid, reference_ms * processed_ms, one)),
+      zero,
     )
     return covariance, reference_ms, processed_ms
 
@@ -239,8 +260,8 @@ def bm_covary(
   )
 
   first = over_channels(
-    reference_bm[:, :nhalf] * window[nhalf:nwin],
-    processed_bm[:, :nhalf] * window[nhalf:nwin],
+    reference_bm[:, :nhalf] * half_window,
+    processed_bm[:, :nhalf] * half_window,
     half_power,
     half_correlation,
   )
@@ -263,7 +284,7 @@ def bm_covary(
       [first[index][:, None], middle[index], last[index][:, None]], axis=1
     )
 
-  covariance = jnp.clip(stack(0), 0, 1)
+  covariance = jnp.clip(stack(0), zero, one)
   # The reference doubles the MS levels to match the dB SL envelope scaling.
   return covariance, 2.0 * stack(1), 2.0 * stack(2)
 
@@ -277,6 +298,9 @@ def ave_covary2(
     The unweighted average, and six averages weighted for progressive loss of
     IHC synchronisation at high frequencies.
   """
+  dtype = jnp.result_type(cross_covariance, reference_mean_square, jnp.float32)
+  cross_covariance = jnp.asarray(cross_covariance, dtype=dtype)
+  reference_mean_square = jnp.asarray(reference_mean_square, dtype=dtype)
   n_channels = cross_covariance.shape[0]
   centre_freq = ear_model.center_frequency(n_channels)
 
@@ -288,32 +312,40 @@ def ave_covary2(
   frequency = centre_freq ** (
     2 * np.atleast_2d(_SYNC_FILTER_ORDERS).repeat(n_channels, axis=0).T
   )
-  sync = jnp.asarray(np.sqrt(cutoff / (cutoff + frequency)))
+  sync = jnp.asarray(np.sqrt(cutoff / (cutoff + frequency)), dtype=dtype)
 
-  signal_rms = jnp.sqrt(reference_mean_square)
-  loudness = jnp.sum(jnp.power(10.0, signal_rms / 20), axis=0) / n_channels
-  loudness = 20 * jnp.log10(loudness)
+  signal_rms = ear_model._safe_sqrt(reference_mean_square)
+  loudness = (
+    jnp.sum(jnp.power(dtype.type(10.0), signal_rms / 20), axis=0) / n_channels
+  )
+  loudness = 20 * jnp.log10(jnp.maximum(loudness, dtype.type(_SMALL)))
   segment_keep = loudness > threshold
   nseg = jnp.sum(segment_keep)
+  zero = jnp.zeros((), dtype=dtype)
+  one = jnp.ones((), dtype=dtype)
 
   tile_keep = (signal_rms > threshold) & segment_keep
-  weight = jnp.where(tile_keep, 1.0, 0.0)
-  sync_weight = jnp.where(tile_keep[None, :, :], sync[:, :, None], 0.0)
+  weight = jnp.where(tile_keep, one, zero)
+  sync_weight = jnp.where(tile_keep[None, :, :], sync[:, :, None], zero)
 
   weighted_sum = jnp.sum(weight * cross_covariance)
   weight_sum = jnp.sum(weight)
   average = jnp.where(
-    weight_sum >= 1, weighted_sum / jnp.maximum(weight_sum, 1), 0.0
+    weight_sum >= 1, weighted_sum / jnp.maximum(weight_sum, one), zero
   )
 
-  sync_covariance = jnp.sum(
-    sync_weight * cross_covariance[None, :, :], axis=(1, 2)
-  ) / jnp.sum(sync_weight, axis=(1, 2))
+  sync_weight_sum = jnp.sum(sync_weight, axis=(1, 2))
+  sync_covariance = jnp.where(
+    sync_weight_sum > 0,
+    jnp.sum(sync_weight * cross_covariance[None, :, :], axis=(1, 2))
+    / jnp.maximum(sync_weight_sum, dtype.type(_SMALL)),
+    zero,
+  )
 
   enough = nseg > 1
   return (
-    jnp.where(enough, average, 0.0),
-    jnp.where(enough, sync_covariance, jnp.zeros(6)),
+    jnp.where(enough, average, zero),
+    jnp.where(enough, sync_covariance, jnp.zeros(6, dtype=dtype)),
   )
 
 
@@ -360,12 +392,14 @@ def _hasqi_backend(
     cross_covariance, reference_mean_square, _SILENCE_THRESHOLD
   )
 
-  d_loud = jnp.clip(1.0 - d_loud_stats[1] / _LOUDNESS_SCALE, 0.0, 1.0)
-  d_slope = jnp.clip(1.0 - d_slope_stats[1], 0.0, 1.0)
+  dtype = reference_db.dtype
+  zero = jnp.zeros((), dtype=dtype)
+  one = jnp.ones((), dtype=dtype)
+  d_loud = jnp.clip(one - d_loud_stats[1] / _LOUDNESS_SCALE, zero, one)
+  d_slope = jnp.clip(one - d_slope_stats[1], zero, one)
   return cepstral_correlation, sync_covariance[4], d_loud, d_slope
 
 
-@precision.in_float64
 def hasqi_v2(
   reference,
   reference_rate,
@@ -381,10 +415,9 @@ def hasqi_v2(
 ):
   """HASQI version 2 quality index.
 
-  Runs in float64 regardless of the caller's JAX configuration, and restores
-  that configuration afterwards; see jax_haspi_hasqi.precision for why the
-  filter bank leaves no choice. Passing float32 inputs is fine and costs about
-  2e-09 against a native float64 run.
+  Runs in the floating-point precision of ``reference`` and ``processed``
+  (``float32`` by default, or ``float64`` when ``jax_enable_x64`` is enabled
+  and inputs are ``float64``).
 
   When citing scores from this function, use:
     "HASQI v2 (pyclarity 0.9.0 algorithm, deterministic noise-free variant)"

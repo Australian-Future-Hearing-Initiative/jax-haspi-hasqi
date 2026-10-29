@@ -75,16 +75,16 @@ jobs:
       - name: Score a golden case from the installed package
         run: |
           /tmp/wheeltest/bin/python - <<'PY'
-          # Deliberately no jax.config.update here: an installed wheel must
-          # work for a caller who has configured nothing, which is the whole
-          # point of promoting internally.
+          import jax
           from jax_haspi_hasqi import goldens, haspi
 
           cases = goldens.cases()
           assert len(cases) == 40, f"expected 40 golden cases, got {len(cases)}"
 
           case = goldens.case("speech_snr20")
-          score, _ = haspi.haspi_v2(
+          want = case.score("haspi")
+
+          score32, _ = haspi.haspi_v2(
             case.reference,
             case.reference_sample_rate,
             case.processed,
@@ -93,8 +93,20 @@ jobs:
             level1=case.level1,
             itype=case.itype,
           )
-          want = case.score("haspi")
-          error = abs(float(score) - want) / want
-          assert error < 1e-9, f"wheel disagrees with its own golden: {error:.2e}"
-          print(f"OK: {len(cases)} goldens packaged, HASPI matches to {error:.1e}")
+          error32 = abs(float(score32) - want) / want
+          assert error32 < 1e-3, f"float32 wheel disagrees with golden: {error32:.2e}"
+
+          with jax.enable_x64():
+            score64, _ = haspi.haspi_v2(
+              case.reference,
+              case.reference_sample_rate,
+              case.processed,
+              case.processed_sample_rate,
+              case.levels,
+              level1=case.level1,
+              itype=case.itype,
+            )
+          error64 = abs(float(score64) - want) / want
+          assert error64 < 1e-9, f"float64 wheel disagrees with golden: {error64:.2e}"
+          print(f"OK: {len(cases)} goldens packaged, HASPI float32 {error32:.1e}, float64 {error64:.1e}")
           PY

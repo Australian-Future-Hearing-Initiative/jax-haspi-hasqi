@@ -29,6 +29,10 @@ def env_filter(
   if filter_cutoff > 0.5 * freq_sub_sample:
     raise ValueError("LP cutoff frequency too high.")
 
+  dtype = jnp.result_type(reference_db, processed_db, jnp.float32)
+  reference_db = jnp.asarray(reference_db, dtype=dtype)
+  processed_db = jnp.asarray(processed_db, dtype=dtype)
+
   # The reference transposes whenever there are more columns than rows, so a
   # band-major input arrives here already oriented sample-major.
   if reference_db.shape[1] > reference_db.shape[0]:
@@ -46,7 +50,7 @@ def env_filter(
     1 - np.cos(2 * np.pi * np.arange(1, nfilt / 2 + 1) / (nfilt + 1))
   )
   taps = np.concatenate((window, np.flip(window)))
-  taps = jnp.asarray(taps / np.sum(taps))
+  taps = jnp.asarray(taps / np.sum(taps), dtype=dtype)
 
   def low_pass(envelope):
     padded = jnp.pad(envelope, ((len(taps) - 1, len(taps) - 1), (0, 0)))
@@ -88,6 +92,7 @@ def cepstral_correlation_coef(
   Returns:
     Mean-removed cepstral coefficients for both signals, (nkept, nbasis).
   """
+  dtype = np.dtype(jnp.result_type(reference_db, processed_db, jnp.float32))
   reference_db = np.asarray(reference_db)
   processed_db = np.asarray(processed_db)
   nbands = reference_db.shape[1]
@@ -109,7 +114,7 @@ def cepstral_correlation_coef(
   processed_cep = processed_db @ basis
   reference_cep -= np.mean(reference_cep, axis=0, keepdims=True)
   processed_cep -= np.mean(processed_cep, axis=0, keepdims=True)
-  return reference_cep, processed_cep
+  return reference_cep.astype(dtype), processed_cep.astype(dtype)
 
 
 def _modulation_filters(freq_sub_sampling, centre_frequencies):
@@ -163,35 +168,36 @@ def fir_modulation_filter(
     freq_sub_sampling, center_frequencies
   )
 
-  reference = jnp.asarray(reference_envelope)
-  processed = jnp.asarray(processed_envelope)
+  dtype = jnp.result_type(reference_envelope, processed_envelope, jnp.float32)
+  reference = jnp.asarray(reference_envelope, dtype=dtype)
+  processed = jnp.asarray(processed_envelope, dtype=dtype)
   sample = np.arange(1, nsamp + 1)
 
   def band(envelope, cosine, sine, coefficients, start):
     """Demodulate to baseband, low-pass, then modulate back up."""
-    demodulated = envelope * (cosine - 1j * sine)[:, None]
-    filtered = jax.vmap(
+    demod_real = envelope * cosine[:, None]
+    demod_imag = -envelope * sine[:, None]
+    convolve = jax.vmap(
       lambda column: jnp.convolve(column, coefficients, "full"),
       in_axes=1,
       out_axes=1,
-    )(demodulated)
-    filtered = filtered[start : start + nsamp]
-    return (
-      jnp.real(filtered) * cosine[:, None] - jnp.imag(filtered) * sine[:, None]
     )
+    filt_real = convolve(demod_real)[start : start + nsamp]
+    filt_imag = convolve(demod_imag)[start : start + nsamp]
+    return filt_real * cosine[:, None] - filt_imag * sine[:, None]
 
   reference_bands = []
   processed_bands = []
   for index, centre in enumerate(center_frequencies):
     if index == 0:
-      cosine = jnp.ones(nsamp)
-      sine = jnp.zeros(nsamp)
+      cosine = jnp.ones(nsamp, dtype=dtype)
+      sine = jnp.zeros(nsamp, dtype=dtype)
     else:
       phase = np.pi * sample * centre / nyquist
-      cosine = jnp.asarray(np.sqrt(2) * np.cos(phase))
-      sine = jnp.asarray(np.sqrt(2) * np.sin(phase))
+      cosine = jnp.asarray(np.sqrt(2) * np.cos(phase), dtype=dtype)
+      sine = jnp.asarray(np.sqrt(2) * np.sin(phase), dtype=dtype)
 
-    coefficients = jnp.asarray(taps[index])
+    coefficients = jnp.asarray(taps[index], dtype=dtype)
     reference_bands.append(
       band(reference, cosine, sine, coefficients, transients[index])
     )
@@ -216,6 +222,11 @@ def modulation_cross_correlation(reference_modulation, processed_modulation):
   Returns:
     One correlation per modulation band.
   """
+  dtype = jnp.result_type(
+    reference_modulation, processed_modulation, jnp.float32
+  )
+  reference_modulation = jnp.asarray(reference_modulation, dtype=dtype)
+  processed_modulation = jnp.asarray(processed_modulation, dtype=dtype)
   reference = reference_modulation - jnp.mean(
     reference_modulation, axis=2, keepdims=True
   )
@@ -226,10 +237,12 @@ def modulation_cross_correlation(reference_modulation, processed_modulation):
   reference_sum = jnp.sum(reference**2, axis=2)
   processed_sum = jnp.sum(processed**2, axis=2)
   valid = (reference_sum >= _SMALL) & (processed_sum >= _SMALL)
+  zero = jnp.zeros((), dtype=dtype)
+  one = jnp.ones((), dtype=dtype)
   covariance = jnp.where(
     valid,
     jnp.abs(jnp.sum(reference * processed, axis=2))
-    / jnp.sqrt(jnp.where(valid, reference_sum * processed_sum, 1.0)),
-    0.0,
+    / jnp.sqrt(jnp.where(valid, reference_sum * processed_sum, one)),
+    zero,
   )
   return jnp.mean(covariance[1:6], axis=0)

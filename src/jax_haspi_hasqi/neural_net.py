@@ -172,10 +172,16 @@ def nn_feed_forward_ensemble(features):
   Returns:
     The ensemble mean, before normalisation.
   """
-  augmented = jnp.concatenate([jnp.ones(1), jnp.asarray(features)])
-  hidden = jax.nn.sigmoid(jnp.einsum("i,nij->nj", augmented, _HIDDEN_WEIGHTS))
-  hidden = jnp.concatenate([jnp.ones((hidden.shape[0], 1)), hidden], axis=1)
-  output = jax.nn.sigmoid(jnp.sum(_OUTPUT_WEIGHTS * hidden, axis=1))
+  dtype = jnp.result_type(features, jnp.float32)
+  features = jnp.asarray(features, dtype=dtype)
+  hidden_weights = jnp.asarray(_HIDDEN_WEIGHTS, dtype=dtype)
+  output_weights = jnp.asarray(_OUTPUT_WEIGHTS, dtype=dtype)
+  augmented = jnp.concatenate([jnp.ones(1, dtype=dtype), features])
+  hidden = jax.nn.sigmoid(jnp.einsum("i,nij->nj", augmented, hidden_weights))
+  hidden = jnp.concatenate(
+    [jnp.ones((hidden.shape[0], 1), dtype=dtype), hidden], axis=1
+  )
+  output = jax.nn.sigmoid(jnp.sum(output_weights * hidden, axis=1))
   return jnp.mean(output)
 
 

@@ -68,7 +68,8 @@ def loss_parameters(hearing_loss, centre_freq):
     OHC attenuation, filter bandwidth, compression kneepoint, compression
     ratio and IHC attenuation, one per channel.
   """
-  hearing_loss = jnp.asarray(hearing_loss)
+  dtype = jnp.result_type(hearing_loss, jnp.float32)
+  hearing_loss = jnp.asarray(hearing_loss, dtype=dtype)
   nfilt = len(centre_freq)
 
   knots = np.concatenate(
@@ -78,12 +79,19 @@ def loss_parameters(hearing_loss, centre_freq):
     (hearing_loss[:1], hearing_loss, hearing_loss[-1:])
   )
   loss = jnp.maximum(
-    jnp.interp(jnp.asarray(centre_freq), jnp.asarray(knots), knot_loss), 0.0
+    jnp.interp(
+      jnp.asarray(centre_freq, dtype=dtype),
+      jnp.asarray(knots, dtype=dtype),
+      knot_loss,
+    ),
+    0.0,
   )
 
-  compression_ratio = 1.25 + 2.25 * np.arange(nfilt) / (nfilt - 1)
+  compression_ratio = jnp.asarray(
+    1.25 + 2.25 * np.arange(nfilt) / (nfilt - 1), dtype=dtype
+  )
   max_ohc = 70 * (1 - (1 / compression_ratio))
-  theoretical_ohc = jnp.asarray(1.25 * max_ohc)
+  theoretical_ohc = 1.25 * max_ohc
 
   severe = loss >= theoretical_ohc
   attn_ohc = jnp.where(severe, 0.8 * theoretical_ohc, 0.8 * loss)
@@ -104,6 +112,8 @@ def resample_24khz(signal, sample_rate):
   The reference rounds both rates to the nearest kHz before comparing them, so
   22050 Hz is treated as 22 kHz.
   """
+  dtype = jnp.result_type(signal, jnp.float32)
+  signal = jnp.asarray(signal, dtype=dtype)
   target_khz = int(np.round(_SAMPLE_RATE / 1000))
   source_khz = int(np.round(sample_rate / 1000))
   if source_khz == target_khz:
@@ -188,8 +198,12 @@ def _gammatone_coefficients(bandwidth, centre_freq, sample_rate):
   Anything algebraically equal to (1-a)^4 is therefore kept factored here, and
   `a` is returned so callers can do the same.
   """
+  bandwidth = jnp.asarray(bandwidth)
+  dtype = jnp.result_type(bandwidth, jnp.float32)
+  bandwidth = bandwidth.astype(dtype)
+  centre_freq = jnp.asarray(centre_freq, dtype=dtype)
   erb = _MIN_BANDWIDTH + (centre_freq / _EAR_Q)
-  tpt = 2 * np.pi / sample_rate
+  tpt = jnp.asarray(2 * np.pi / sample_rate, dtype=dtype)
   a = jnp.exp(-bandwidth * tpt * erb * 1.019)
   a_1, a_2, a_3, a_4, a_5 = (
     4.0 * a,
@@ -214,7 +228,13 @@ def _carrier(npts, centre_freq, sample_rate):
   trigonometry directly agrees to ~1e-11 over the lengths used here and is
   what the vectorised form wants.
   """
-  theta = (2 * np.pi / sample_rate) * centre_freq * jnp.arange(npts)
+  dtype = jnp.result_type(centre_freq, jnp.float32)
+  centre_freq = jnp.asarray(centre_freq, dtype=dtype)
+  theta = (
+    jnp.asarray(2 * np.pi / sample_rate, dtype=dtype)
+    * centre_freq
+    * jnp.arange(npts, dtype=dtype)
+  )
   return -jnp.sin(theta), jnp.cos(theta)
 
 
@@ -295,7 +315,7 @@ def env_compress_basilar_membrane(
     1 - (1 / compression_ratio)
   )
 
-  gain = jnp.power(10.0, gain / 20)
+  gain = jnp.power(jnp.asarray(10.0, dtype=envelope.dtype), gain / 20)
   low_b, low_a = scipy.signal.butter(1, 800 / (0.5 * sample_rate))
   gain = filters.lfilter(low_b, low_a, gain)
   return gain * envelope, gain * motion
@@ -396,16 +416,21 @@ def basilar_membrane_add_noise(motion, noise, level1, threshold=_IHC_THRESHOLD):
     level1: dB SPL corresponding to RMS 1.
     threshold: Noise level in dB re auditory threshold.
   """
-  return motion + jnp.power(10.0, (threshold - level1) / 20) * noise
+  scale = jnp.power(
+    jnp.asarray(10.0, dtype=motion.dtype),
+    jnp.asarray((threshold - level1) / 20, dtype=motion.dtype),
+  )
+  return motion + scale * jnp.asarray(noise, dtype=motion.dtype)
 
 
 def group_delay_compensate(
   signal, bandwidths, centre_freq, sample_rate=_SAMPLE_RATE
 ):
   """Align the bands to a common group delay."""
-  erb = _MIN_BANDWIDTH + (jnp.asarray(centre_freq) / _EAR_Q)
-  tpt = 2 * np.pi / sample_rate
-  a = jnp.exp(-tpt * 1.019 * bandwidths * erb)
+  dtype = signal.dtype
+  erb = _MIN_BANDWIDTH + (jnp.asarray(centre_freq, dtype=dtype) / _EAR_Q)
+  tpt = jnp.asarray(2 * np.pi / sample_rate, dtype=dtype)
+  a = jnp.exp(-tpt * 1.019 * jnp.asarray(bandwidths, dtype=dtype) * erb)
 
   # Closed form of group_delay_at_dc for this filter. The generic expression
   # divides by sum(denominator), which is (1-a)^4 and cancels to exactly zero
@@ -459,6 +484,10 @@ def _ear_model_aligned(
   m_delay,
 ):
   """The fixed-shape part of ear_model, once alignment has been resolved."""
+  dtype = jnp.result_type(reference, processed, jnp.float32)
+  reference = jnp.asarray(reference, dtype=dtype)
+  processed = jnp.asarray(processed, dtype=dtype)
+  hearing_loss = jnp.asarray(hearing_loss, dtype=dtype)
   centre_freq = center_frequency(nchan)
   attn_ohc_y, bandwidth_min_y, low_knee_y, ratio_y, attn_ihc_y = (
     loss_parameters(hearing_loss, centre_freq)
@@ -473,10 +502,10 @@ def _ear_model_aligned(
   # is never applied. Preserved deliberately; see docs/porting_notes.md.
   centre_freq_control = center_frequency(nchan)
   _, bandwidth_1, _, _, _ = loss_parameters(
-    np.full(6, 100.0), centre_freq_control
+    jnp.full(6, 100.0, dtype=dtype), centre_freq_control
   )
-  centre_freq = jnp.asarray(centre_freq)
-  centre_freq_control = jnp.asarray(centre_freq_control)
+  centre_freq = jnp.asarray(centre_freq, dtype=dtype)
+  centre_freq_control = jnp.asarray(centre_freq_control, dtype=dtype)
 
   nsamp = reference.shape[0]
   if itype == 1:
@@ -656,39 +685,35 @@ def ear_model(
     Envelope and BM motion per band for each signal, the long-term dB SL
     spectra, and the model sampling rate.
   """
-  # Cast rather than asarray: enabling x64 does not promote an array that is
-  # already float32, so a float32 caller would otherwise run the filter bank
-  # in single precision and get NaN out of HASQI. The cast costs ~4e-08 on the
-  # score, which is what float32 input data is worth; computing in float32
-  # costs everything.
+  dtype = jnp.result_type(reference, processed, jnp.float32)
   reference_24k = resample_24khz(
-    jnp.asarray(reference, jnp.float64), reference_rate
+    jnp.asarray(reference, dtype=dtype), reference_rate
   )
   processed_24k = resample_24khz(
-    jnp.asarray(processed, jnp.float64), processed_rate
+    jnp.asarray(processed, dtype=dtype), processed_rate
   )
 
   shortest = min(reference_24k.shape[0], processed_24k.shape[0])
   reference_24k, processed_24k, _ = input_align(
     reference_24k[:shortest], processed_24k[:shortest]
   )
-  reference_24k = jnp.asarray(reference_24k, jnp.float64)
-  processed_24k = jnp.asarray(processed_24k, jnp.float64)
+  reference_24k = jnp.asarray(reference_24k, dtype=dtype)
+  processed_24k = jnp.asarray(processed_24k, dtype=dtype)
 
   shape = (nchan, reference_24k.shape[0])
   if reference_noise is None:
-    reference_noise = jnp.zeros(shape)
+    reference_noise = jnp.zeros(shape, dtype=dtype)
   if processed_noise is None:
-    processed_noise = jnp.zeros(shape)
+    processed_noise = jnp.zeros(shape, dtype=dtype)
 
   outputs = _ear_model_aligned(
     reference_24k,
     processed_24k,
-    jnp.asarray(hearing_loss, jnp.float64),
+    jnp.asarray(hearing_loss, dtype=dtype),
     itype,
     level1,
-    jnp.asarray(reference_noise),
-    jnp.asarray(processed_noise),
+    jnp.asarray(reference_noise, dtype=dtype),
+    jnp.asarray(processed_noise, dtype=dtype),
     nchan,
     m_delay,
   )

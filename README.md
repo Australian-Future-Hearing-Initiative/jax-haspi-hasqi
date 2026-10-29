@@ -34,22 +34,13 @@ interpolate first — on a log-frequency axis, as
 silent and can reach 10 dB in the top band.
 
 > [!NOTE]
-> **These metrics compute in float64 internally, whatever you have
-> configured.** Both entry points enable x64 for the duration of the call and
-> restore your setting afterwards, and both cast their input signals up, since
-> enabling x64 does not promote an array that is already float32.
->
-> This is not fussiness. The gammatone filter bank is a 4th-order IIR whose
-> poles sit against the unit circle — 0.9913 at the 80 Hz channel — which needs
-> about nine significant digits in the denominator to place the filter
-> correctly, and float32 carries seven. Computed in float32 the filter bank
-> output is wrong by a relative 5.6e+03, HASPI then trips its own silence gate
-> and HASQI returns NaN. Deriving the coefficients in float64 does not rescue
-> it either: a float32 recursion still drifts by 6e-03.
->
-> Passing float32 signals costs about **4e-08** on the score, which is what
-> float32 sample data is worth, and three orders below the reference's own
-> 6e-03 run-to-run spread. The promotion does not disturb the jit cache.
+> **Precision follows the caller's dtype.** In a default `float32` JAX process
+> (or when given `float32` inputs), both metrics execute in `float32` on CPU,
+> GPU, or TPU — the 4th-order gammatone cascade (`filters.cascaded_one_pole`)
+> and closed-form group delay keep `float32` within ~`6e-3` relative of
+> `pyclarity==0.9.0`. When `jax_enable_x64` is enabled and `float64` inputs are
+> passed (or wrapped with `precision.in_float64`), they execute in `float64` and
+> match `pyclarity==0.9.0` to ~`2.8e-8` relative.
 
 ### Performance
 

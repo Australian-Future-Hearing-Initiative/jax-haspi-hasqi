@@ -1,4 +1,4 @@
-"""Precision policy: float64 is the default; float32 is viable but opt-in.
+"""Precision policy: respect caller and input dtype.
 
 The gammatone bank is a 4th-order IIR whose denominator is a *quadruple* pole,
 (1 - a z^-1)^4, with a = 0.9911 at the 80 Hz channel. The poles themselves are
@@ -20,16 +20,13 @@ factor intact:
 With those in place float32 runs end to end on every golden case: worst
 relative error 1.30% on the final score, worst absolute 3.8e-03, no raises.
 The one case above 1% is a HASQI score of 0.0763, where 1.30% is 9.9e-04
-absolute. Before the fixes, HASPI raised "Signal below threshold" on 23 of 24
-cases and HASQI returned NaN.
+absolute.
 
-float64 nonetheless remains the default, because the goldens are the only
-evidence and they are short and largely synthetic. `in_float64` promotes for
-the duration of the call and restores the caller's configuration afterwards,
-so a float32 caller gets a score agreeing with a native float64 run to about
-2e-09. Callers who want float32 -- for an accelerator that rejects float64, or
-for speed -- can call the undecorated `haspi_v2.__wrapped__` or
-`hasqi_v2.__wrapped__`; expect agreement at the 1% level, not 1e-09.
+`haspi_v2`, `hasqi_v2` and `ear_model` compute in the floating-point dtype of
+their inputs (`jnp.result_type(reference, processed, jnp.float32)`): float32 in
+a default JAX process or when given float32 arrays, and float64 when x64 is
+enabled and the inputs are float64. `in_float64` and `require_x64` remain
+available for callers that want explicit double-precision promotion.
 """
 
 import contextlib
