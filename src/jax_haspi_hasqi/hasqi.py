@@ -47,12 +47,15 @@ def _gather_segments(signal, starts, length):
     Shape (nchan, nseg, length).
   """
   padded = jnp.pad(signal, ((0, 0), (0, length)))
-  index = jnp.asarray(starts)[:, None] + np.arange(length)[None, :]
+  index = jnp.asarray(starts)[:, None] + jnp.arange(length)[None, :]
   return padded[:, index]
 
 
 def env_smooth(
-  envelopes, segment_size=_SEGMENT_COVARIANCE, sample_rate=24000.0
+  envelopes,
+  segment_size=_SEGMENT_COVARIANCE,
+  sample_rate=24000.0,
+  valid_len=None,
 ):
   """Window and subsample the envelopes to a 125 Hz frame rate.
 
@@ -60,6 +63,7 @@ def env_smooth(
     envelopes: Envelope per band, shape (nchan, nsamp).
     segment_size: Averaging segment in ms.
     sample_rate: Envelope sampling rate in Hz.
+    valid_len: Optional active sample count when envelopes are zero-padded.
   """
   dtype = jnp.result_type(envelopes, jnp.float32)
   envelopes = jnp.asarray(envelopes, dtype=dtype)
@@ -71,22 +75,39 @@ def env_smooth(
   window_sum = jnp.sum(window)
   half_sum = jnp.sum(window[nhalf:nwin])
 
-  starts, nseg = _segment_layout(envelopes.shape[1], nwin)
+  starts, max_nseg = _segment_layout(envelopes.shape[1], nwin)
 
   first = jnp.sum(envelopes[:, :nhalf] * window[nhalf:nwin], axis=1) / half_sum
   middle = (
     jnp.sum(_gather_segments(envelopes, starts, nwin) * window, axis=2)
     / window_sum
   )
+  if valid_len is None:
+    last_start = np.array([nhalf * (max_nseg - 1)])
+    last = (
+      jnp.sum(
+        _gather_segments(envelopes, last_start, nhalf)[:, 0] * window[:nhalf],
+        axis=1,
+      )
+      / half_sum
+    )
+    return jnp.concatenate([first[:, None], middle, last[:, None]], axis=1)
+
+  nseg = jnp.where(
+    valid_len > 0, 1 + (valid_len // nwin) + ((valid_len - nhalf) // nwin), 0
+  )
+  last_start = jnp.array([jnp.maximum(nhalf * (nseg - 1), 0)])
   last = (
     jnp.sum(
-      _gather_segments(envelopes, np.array([nhalf * (nseg - 1)]), nhalf)[:, 0]
-      * window[:nhalf],
+      _gather_segments(envelopes, last_start, nhalf)[:, 0] * window[:nhalf],
       axis=1,
     )
     / half_sum
   )
-  return jnp.concatenate([first[:, None], middle, last[:, None]], axis=1)
+  out = jnp.concatenate([first[:, None], middle, last[:, None]], axis=1)
+  idx = jnp.arange(max_nseg)
+  out = jnp.where(idx[None, :] == (nseg - 1), last[:, None], out)
+  return jnp.where(idx[None, :] < nseg, out, dtype.type(-100.0))
 
 
 def _mel_cepstrum_basis(nbands, nbasis=_CEPSTRAL_COEFFICIENTS):
@@ -190,6 +211,7 @@ def bm_covary(
   processed_bm,
   segment_size=_SEGMENT_COVARIANCE,
   sample_rate=24000.0,
+  valid_len=None,
 ):
   """Normalised cross-covariance of the BM motion, per band and 16 ms segment.
 
@@ -226,7 +248,7 @@ def bm_covary(
   one = jnp.ones((), dtype=dtype)
 
   npts = reference_bm.shape[1]
-  starts, nseg = _segment_layout(npts, nwin)
+  starts, max_nseg = _segment_layout(npts, nwin)
 
   def covary(reference_seg, processed_seg, power, correction):
     """Cross-covariance of one windowed segment, over the trailing axis."""
@@ -271,7 +293,14 @@ def bm_covary(
     window_power,
     window_correlation,
   )
-  last_start = np.array([nhalf * (nseg - 1)])
+  if valid_len is None:
+    last_start = np.array([nhalf * (max_nseg - 1)])
+  else:
+    nseg = jnp.where(
+      valid_len > 0, 1 + (valid_len // nwin) + ((valid_len - nhalf) // nwin), 0
+    )
+    last_start = jnp.array([jnp.maximum(nhalf * (nseg - 1), 0)])
+
   last = over_channels(
     _gather_segments(reference_bm, last_start, nhalf)[:, 0] * window[:nhalf],
     _gather_segments(processed_bm, last_start, nhalf)[:, 0] * window[:nhalf],
@@ -280,9 +309,14 @@ def bm_covary(
   )
 
   def stack(index):
-    return jnp.concatenate(
+    out = jnp.concatenate(
       [first[index][:, None], middle[index], last[index][:, None]], axis=1
     )
+    if valid_len is not None:
+      idx = jnp.arange(max_nseg)
+      out = jnp.where(idx[None, :] == (nseg - 1), last[index][:, None], out)
+      out = jnp.where(idx[None, :] < nseg, out, zero)
+    return out
 
   covariance = jnp.clip(stack(0), zero, one)
   # The reference doubles the MS levels to match the dB SL envelope scaling.
@@ -367,6 +401,7 @@ def _hasqi_backend(
   silence_threshold,
   segment_covariance,
   sample_rate,
+  valid_len=None,
 ):
   """Everything after the ear model, as one compiled region.
 
@@ -377,8 +412,12 @@ def _hasqi_backend(
   Returns:
     The cepstral correlation, BM sync5, and the two linear terms.
   """
-  reference_smooth = env_smooth(reference_db, segment_covariance, sample_rate)
-  processed_smooth = env_smooth(processed_db, segment_covariance, sample_rate)
+  reference_smooth = env_smooth(
+    reference_db, segment_covariance, sample_rate, valid_len=valid_len
+  )
+  processed_smooth = env_smooth(
+    processed_db, segment_covariance, sample_rate, valid_len=valid_len
+  )
   cepstral_correlation, _ = mel_cepstrum_correlation(
     reference_smooth, processed_smooth, silence_threshold
   )
@@ -386,7 +425,11 @@ def _hasqi_backend(
   d_loud_stats, _, d_slope_stats = spectrum_diff(reference_sl, processed_sl)
 
   cross_covariance, reference_mean_square, _ = bm_covary(
-    reference_bm, processed_bm, segment_covariance, sample_rate
+    reference_bm,
+    processed_bm,
+    segment_covariance,
+    sample_rate,
+    valid_len=valid_len,
   )
   _, sync_covariance = ave_covary2(
     cross_covariance, reference_mean_square, _SILENCE_THRESHOLD
@@ -417,7 +460,8 @@ def hasqi_v2(
 
   Runs in the floating-point precision of ``reference`` and ``processed``
   (``float32`` by default, or ``float64`` when ``jax_enable_x64`` is enabled
-  and inputs are ``float64``).
+  and inputs are ``float64``). Returns ``0.0`` when the reference fails to
+  clear the silence threshold.
 
   When citing scores from this function, use:
     "HASQI v2 (pyclarity 0.9.0 algorithm, deterministic noise-free variant)"
@@ -453,7 +497,8 @@ def hasqi_v2(
     reference_sl,
     processed_sl,
     sample_rate,
-  ) = ear_model.ear_model(
+    valid_len,
+  ) = ear_model._run_ear_model(
     reference,
     reference_rate,
     processed,
@@ -475,6 +520,7 @@ def hasqi_v2(
     silence_threshold=silence_threshold,
     segment_covariance=segment_covariance,
     sample_rate=sample_rate,
+    valid_len=valid_len,
   )
 
   nonlinear = (cepstral_correlation**2) * bm_sync5

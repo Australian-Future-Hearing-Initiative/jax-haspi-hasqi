@@ -15,25 +15,49 @@ _SILENCE_THRESHOLD = 2.5
 _NERVE_DITHER = 0.1
 
 
-@functools.partial(jax.jit, static_argnames=("freq_sub_sample",))
-def _haspi_backend(reference_cep, processed_cep, freq_sub_sample):
-  """Everything downstream of the cepstral gate, as one compiled region.
-
-  The gate itself stays in numpy -- it keeps a data-dependent number of time
-  samples that the filterbank then convolves along, so it cannot be a mask.
-  Everything after it has a shape fixed by that gate, so it compiles as a
-  unit; separately it cost ~2.5 s per distinct shape for 30 ms of arithmetic.
+@functools.partial(jax.jit, static_argnames=("f_lp", "sample_rate"))
+def _haspi_backend(
+  reference_db,
+  processed_db,
+  valid_len,
+  f_lp,
+  sample_rate,
+  cepstral_noise=None,
+):
+  """Everything downstream of the ear model, as one compiled region.
 
   Returns:
     The intelligibility estimate and the ten modulation-band correlations.
   """
+  freq_sub_sample = 8.0 * f_lp
+  reference_lp, processed_lp = modulation.env_filter(
+    reference_db,
+    processed_db,
+    f_lp,
+    freq_sub_sample,
+    sample_rate,
+    valid_len=valid_len,
+  )
+  reference_cep, processed_cep, nkept = modulation.cepstral_correlation_coef(
+    reference_lp,
+    processed_lp,
+    _SILENCE_THRESHOLD,
+    _NERVE_DITHER,
+    _CEPSTRAL_BASIS,
+    cepstral_noise,
+  )
   reference_mod, processed_mod, _ = modulation.fir_modulation_filter(
     reference_cep, processed_cep, freq_sub_sample
   )
   correlations = modulation.modulation_cross_correlation(
-    reference_mod, processed_mod
+    reference_mod, processed_mod, nkept=nkept
   )
-  return neural_net.intelligibility(correlations), correlations
+  score = jnp.where(
+    nkept > 1,
+    neural_net.intelligibility(correlations),
+    jnp.zeros((), dtype=correlations.dtype),
+  )
+  return score, correlations
 
 
 def haspi_v2(
@@ -53,7 +77,8 @@ def haspi_v2(
 
   Runs in the floating-point precision of ``reference`` and ``processed``
   (``float32`` by default, or ``float64`` when ``jax_enable_x64`` is enabled
-  and inputs are ``float64``).
+  and inputs are ``float64``). Returns ``0.0`` when the reference fails to
+  clear the silence threshold.
 
   When citing scores from this function, use:
     "HASPI v2 (pyclarity 0.9.0 algorithm, deterministic noise-free variant)"
@@ -79,34 +104,27 @@ def haspi_v2(
   """
   # shift=None is not passed on: the ear model already omits the 0.02 basal
   # shift HASPI's own docstring describes, which is the published defect.
-  reference_db, _, processed_db, _, _, _, sample_rate = ear_model.ear_model(
-    reference,
-    reference_rate,
-    processed,
-    processed_rate,
-    hearing_loss,
-    itype,
-    level1,
-    reference_noise=reference_noise,
-    processed_noise=processed_noise,
+  reference_db, _, processed_db, _, _, _, sample_rate, valid_len = (
+    ear_model._run_ear_model(
+      reference,
+      reference_rate,
+      processed,
+      processed_rate,
+      hearing_loss,
+      itype,
+      level1,
+      reference_noise=reference_noise,
+      processed_noise=processed_noise,
+    )
   )
-
-  # Subsample to two octaves above the cutoff.
-  freq_sub_sample = 8.0 * f_lp
-  reference_lp, processed_lp = modulation.env_filter(
-    reference_db, processed_db, f_lp, freq_sub_sample, sample_rate
+  return _haspi_backend(
+    reference_db,
+    processed_db,
+    valid_len,
+    f_lp,
+    sample_rate,
+    cepstral_noise=cepstral_noise,
   )
-
-  reference_cep, processed_cep = modulation.cepstral_correlation_coef(
-    reference_lp,
-    processed_lp,
-    _SILENCE_THRESHOLD,
-    _NERVE_DITHER,
-    _CEPSTRAL_BASIS,
-    cepstral_noise,
-  )
-
-  return _haspi_backend(reference_cep, processed_cep, freq_sub_sample)
 
 
 def haspi_v2_better_ear(

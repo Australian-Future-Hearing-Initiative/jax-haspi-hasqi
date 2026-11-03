@@ -121,7 +121,12 @@ def resample_24khz(signal, sample_rate):
 
   resampled = filters.resample_poly(signal, target_khz, source_khz)
   if source_khz < target_khz:
-    ratio = jnp.sqrt(jnp.mean(signal**2)) / jnp.sqrt(jnp.mean(resampled**2))
+    rms_out = _safe_sqrt(jnp.mean(resampled**2))
+    ratio = jnp.where(
+      rms_out > 0,
+      _safe_sqrt(jnp.mean(signal**2)) / jnp.maximum(rms_out, _SMALL),
+      0.0,
+    )
     return ratio * resampled
 
   # Downsampling: compare RMS inside the 21 kHz band both filters pass.
@@ -130,55 +135,72 @@ def resample_24khz(signal, sample_rate):
   target_b, target_a = scipy.signal.cheby2(order, attenuation, 21 / target_khz)
   source_band = filters.lfilter(source_b, source_a, signal)
   target_band = filters.lfilter(target_b, target_a, resampled)
-  ratio = jnp.sqrt(jnp.mean(source_band**2)) / jnp.sqrt(
-    jnp.mean(target_band**2)
+  rms_target = _safe_sqrt(jnp.mean(target_band**2))
+  ratio = jnp.where(
+    rms_target > 0,
+    _safe_sqrt(jnp.mean(source_band**2)) / jnp.maximum(rms_target, _SMALL),
+    0.0,
   )
   return ratio * resampled
 
 
-def input_align(reference, processed):
+@functools.partial(jax.jit, static_argnames=("candidates",))
+def input_align(reference, processed, candidates=8):
   """Align the processed signal to the reference and prune leading silence.
 
-  Numpy rather than JAX: the output length depends on where the reference
-  crosses its own amplitude threshold, so the shape is data-dependent.
+  Shifts the active slice reference[start : stop + 1] to the front of a
+  fixed-length array and zero-pads the remainder so the output shape is
+  invariant to signal content. When no sample clears the silence threshold,
+  returns all zeros with start=0 and stop=-1 (valid_len=0).
 
   Returns:
     The aligned pair, and the (start, stop, delay) the alignment chose.
-
-  Raises:
-    ValueError: If no reference sample exceeds the silence threshold.
   """
-  reference = np.asarray(reference)
-  processed = np.asarray(processed)
-  processed_n = len(processed)
-  min_length = min(len(reference), processed_n)
+  dtype = jnp.result_type(reference, processed, jnp.float32)
+  reference = jnp.asarray(reference, dtype=dtype)
+  processed = jnp.asarray(processed, dtype=dtype)
+  processed_n = processed.shape[0]
+  min_length = min(reference.shape[0], processed_n)
 
-  head_reference = reference[:min_length] - np.mean(reference[:min_length])
-  head_processed = processed[:min_length] - np.mean(processed[:min_length])
-  correlation = scipy.signal.correlate(head_reference, head_processed, "full")
-  delay = min_length - np.argmax(np.abs(correlation)) - 1
-  # Back up 2 ms to allow for dispersion.
-  delay = int(np.rint(delay - 2 * _SAMPLE_RATE / 1000.0))
-
-  if delay > 0:
-    processed = np.concatenate((processed[delay:processed_n], np.zeros(delay)))
-  else:
-    processed = np.concatenate(
-      (np.zeros(-delay), processed[: processed_n + delay])
-    )
-
-  above = np.where(np.abs(reference) > 0.001 * np.max(np.abs(reference)))[0]
-  # Upstream indexes this empty and raises IndexError, which callers read as a
-  # bug rather than an unscoreable clip. Same inputs rejected, named cause.
-  if above.size == 0:
-    raise ValueError("reference has no samples above the silence threshold")
-  start = above[0]
-  stop = min(above[-1], processed_n)
-  return (
-    reference[start : stop + 1],
-    processed[start : stop + 1],
-    (start, stop, delay),
+  head_reference = reference[:min_length] - jnp.mean(reference[:min_length])
+  head_processed = processed[:min_length] - jnp.mean(processed[:min_length])
+  correlation = filters.correlate_full(
+    head_reference, head_processed, dtype=jnp.float32
   )
+  shortlist = lax.top_k(
+    jnp.abs(correlation), min(candidates, 2 * min_length - 1)
+  )[1]
+  exact = jnp.abs(
+    filters.correlate_at_lags(head_reference, head_processed, shortlist)
+  )
+  delay = min_length - shortlist[jnp.argmax(exact)] - 1
+  # Back up 2 ms to allow for dispersion.
+  delay = jnp.rint(delay - 2 * _SAMPLE_RATE / 1000.0).astype(jnp.int32)
+
+  above = jnp.abs(reference) > (0.001 * jnp.max(jnp.abs(reference)))
+  any_above = jnp.any(above)
+  delay = jnp.where(any_above, delay, 0)
+  processed = filters.shift_with_zeros(processed, delay)
+
+  start = jnp.where(any_above, jnp.argmax(above), 0).astype(jnp.int32)
+  last_above = reference.shape[0] - 1 - jnp.argmax(above[::-1])
+  stop = jnp.where(any_above, jnp.minimum(last_above, processed_n), -1).astype(
+    jnp.int32
+  )
+  ref_valid = jnp.maximum(jnp.minimum(stop + 1, reference.shape[0]) - start, 0)
+  proc_valid = jnp.maximum(jnp.minimum(stop + 1, processed_n) - start, 0)
+
+  aligned_reference = jnp.where(
+    jnp.arange(reference.shape[0]) < ref_valid,
+    filters.shift_with_zeros(reference, start),
+    0.0,
+  )
+  aligned_processed = jnp.where(
+    jnp.arange(processed_n) < proc_valid,
+    filters.shift_with_zeros(processed, start),
+    0.0,
+  )
+  return aligned_reference, aligned_processed, (start, stop, delay)
 
 
 def middle_ear(signal, sample_rate=_SAMPLE_RATE):
@@ -286,12 +308,16 @@ def gammatone_basilar_membrane(
   )
 
 
-def bandwidth_adjust(control, bandwidth_min, bandwidth_max, level1):
+def bandwidth_adjust(
+  control, bandwidth_min, bandwidth_max, level1, valid_len=None
+):
   """Widen the auditory filter at high signal levels.
 
   The reference branches at 50 and 100 dB SPL; the clip is the same function.
   """
-  control_db = 20 * jnp.log10(jnp.sqrt(jnp.mean(control**2))) + level1
+  denom = jnp.maximum(control.shape[0] if valid_len is None else valid_len, 1)
+  rms = _safe_sqrt(jnp.sum(control**2) / denom)
+  control_db = 20 * jnp.log10(jnp.maximum(rms, _SMALL)) + level1
   fraction = jnp.clip((control_db - 50) / 50, 0.0, 1.0)
   return bandwidth_min + fraction * (bandwidth_max - bandwidth_min)
 
@@ -322,7 +348,12 @@ def env_compress_basilar_membrane(
 
 
 def envelope_align(
-  reference, output, sample_rate=_SAMPLE_RATE, corr_range=100, candidates=8
+  reference,
+  output,
+  sample_rate=_SAMPLE_RATE,
+  corr_range=100,
+  candidates=8,
+  valid_len=None,
 ):
   """Shift the output to the reference's envelope peak, over a +/-100 ms window.
 
@@ -344,23 +375,36 @@ def envelope_align(
       above float32's resolution, and costs nothing measurable because the
       transform dominates. Two suffices on the cases measured but clears that
       floor by only 1.4x.
+    valid_len: Number of active leading samples when `reference` and `output`
+      are zero-padded to a fixed length.
   """
   npts = reference.shape[0]
-  lags = min(int(np.rint(0.001 * corr_range * sample_rate)), npts)
+  max_lags = min(int(np.rint(0.001 * corr_range * sample_rate)), npts)
 
   correlation = filters.correlate_full(reference, output, dtype=jnp.float32)
   # The reference slices past the end when lags == npts; numpy clips, so do
   # the same rather than reading out of bounds.
-  start, stop = npts - lags, min(npts + lags, 2 * npts - 1)
+  start, stop = npts - max_lags, min(npts + max_lags, 2 * npts - 1)
   window = lax.dynamic_slice(correlation, (start,), (stop - start,))
+
+  if valid_len is not None:
+    lags = jnp.minimum(max_lags, valid_len)
+    indices = start + jnp.arange(stop - start)
+    in_range = (indices >= npts - lags) & (
+      indices < jnp.minimum(npts + lags, npts + valid_len - 1)
+    )
+    window = jnp.where(in_range, window, -jnp.inf)
 
   # top_k breaks ties towards the lower index, as argmax does, so an all-zero
   # window still aligns at the same lag it always did. argpartition does not.
   # The clamp only bites for npts <= 4, far shorter than any real clip.
   shortlist = start + lax.top_k(window, min(candidates, stop - start))[1]
   exact = filters.correlate_at_lags(reference, output, shortlist)
-  location = shortlist[jnp.argmax(exact)] - start
-  return filters.shift_with_zeros(output, lags - location - 1)
+  shift = (npts - 1) - shortlist[jnp.argmax(exact)]
+  shifted = filters.shift_with_zeros(output, shift)
+  if valid_len is not None:
+    shifted = jnp.where(jnp.arange(npts) < valid_len, shifted, 0.0)
+  return shifted
 
 
 def envelope_sl(envelope, motion, attn_ihc, level1):
@@ -482,12 +526,19 @@ def _ear_model_aligned(
   processed_noise,
   nchan,
   m_delay,
+  valid_len=None,
 ):
   """The fixed-shape part of ear_model, once alignment has been resolved."""
   dtype = jnp.result_type(reference, processed, jnp.float32)
   reference = jnp.asarray(reference, dtype=dtype)
   processed = jnp.asarray(processed, dtype=dtype)
   hearing_loss = jnp.asarray(hearing_loss, dtype=dtype)
+  nsamp = reference.shape[0]
+  if valid_len is None:
+    valid_len = nsamp
+  valid_mask = jnp.arange(nsamp) < valid_len
+  denom_len = jnp.maximum(valid_len, 1)
+
   centre_freq = center_frequency(nchan)
   attn_ohc_y, bandwidth_min_y, low_knee_y, ratio_y, attn_ihc_y = (
     loss_parameters(hearing_loss, centre_freq)
@@ -507,13 +558,16 @@ def _ear_model_aligned(
   centre_freq = jnp.asarray(centre_freq, dtype=dtype)
   centre_freq_control = jnp.asarray(centre_freq_control, dtype=dtype)
 
-  nsamp = reference.shape[0]
   if itype == 1:
     fir, _ = nalr.build(hearing_loss, _NALR_TAPS, _SAMPLE_RATE)
     reference = nalr.apply(fir, reference)[_NALR_TAPS : _NALR_TAPS + nsamp]
+    reference = jnp.where(valid_mask, reference, 0.0)
 
-  reference_mid = middle_ear(reference)
-  processed_mid = middle_ear(processed)
+  reference_mid = jnp.where(valid_mask, middle_ear(reference), 0.0)
+  processed_mid = jnp.where(valid_mask, middle_ear(processed), 0.0)
+
+  def rms(x):
+    return _safe_sqrt(jnp.sum(x**2) / denom_len)
 
   def channel(index):
     reference_control, _, processed_control, _ = gammatone_basilar_membrane(
@@ -523,11 +577,21 @@ def _ear_model_aligned(
       bandwidth_1[index],
       centre_freq_control[index],
     )
+    reference_control = jnp.where(valid_mask, reference_control, 0.0)
+    processed_control = jnp.where(valid_mask, processed_control, 0.0)
     reference_bandwidth = bandwidth_adjust(
-      reference_control, bandwidth_min_x[index], bandwidth_1[index], level1
+      reference_control,
+      bandwidth_min_x[index],
+      bandwidth_1[index],
+      level1,
+      valid_len=valid_len,
     )
     processed_bandwidth = bandwidth_adjust(
-      processed_control, bandwidth_min_y[index], bandwidth_1[index], level1
+      processed_control,
+      bandwidth_min_y[index],
+      bandwidth_1[index],
+      level1,
+      valid_len=valid_len,
     )
 
     xenv, xbm, yenv, ybm = gammatone_basilar_membrane(
@@ -537,6 +601,10 @@ def _ear_model_aligned(
       processed_bandwidth,
       centre_freq[index],
     )
+    xenv = jnp.where(valid_mask, xenv, 0.0)
+    xbm = jnp.where(valid_mask, xbm, 0.0)
+    yenv = jnp.where(valid_mask, yenv, 0.0)
+    ybm = jnp.where(valid_mask, ybm, 0.0)
 
     reference_compressed, reference_motion = env_compress_basilar_membrane(
       xenv,
@@ -557,9 +625,11 @@ def _ear_model_aligned(
       level1,
     )
     processed_compressed = envelope_align(
-      reference_compressed, processed_compressed
+      reference_compressed, processed_compressed, valid_len=valid_len
     )
-    processed_motion = envelope_align(reference_motion, processed_motion)
+    processed_motion = envelope_align(
+      reference_motion, processed_motion, valid_len=valid_len
+    )
 
     reference_compressed, reference_motion = envelope_sl(
       reference_compressed, reference_motion, attn_ihc_x[index], level1
@@ -567,6 +637,10 @@ def _ear_model_aligned(
     processed_compressed, processed_motion = envelope_sl(
       processed_compressed, processed_motion, attn_ihc_y[index], level1
     )
+    reference_compressed = jnp.where(valid_mask, reference_compressed, 0.0)
+    reference_motion = jnp.where(valid_mask, reference_motion, 0.0)
+    processed_compressed = jnp.where(valid_mask, processed_compressed, 0.0)
+    processed_motion = jnp.where(valid_mask, processed_motion, 0.0)
 
     reference_db, reference_motion = inner_hair_cell_adaptation(
       reference_compressed, reference_motion
@@ -574,15 +648,19 @@ def _ear_model_aligned(
     processed_db, processed_motion = inner_hair_cell_adaptation(
       processed_compressed, processed_motion
     )
+    reference_db = jnp.where(valid_mask, reference_db, 0.0)
+    reference_motion = jnp.where(valid_mask, reference_motion, 0.0)
+    processed_db = jnp.where(valid_mask, processed_db, 0.0)
+    processed_motion = jnp.where(valid_mask, processed_motion, 0.0)
     return (
       reference_db,
       reference_motion,
       processed_db,
       processed_motion,
-      jnp.sqrt(jnp.mean(xenv**2)),
-      jnp.sqrt(jnp.mean(yenv**2)),
-      jnp.sqrt(jnp.mean(reference_control**2)),
-      jnp.sqrt(jnp.mean(processed_control**2)),
+      rms(xenv),
+      rms(yenv),
+      rms(reference_control),
+      rms(processed_control),
       reference_bandwidth,
       processed_bandwidth,
     )
@@ -600,11 +678,15 @@ def _ear_model_aligned(
     _,
   ) = jax.vmap(channel)(jnp.arange(nchan))
 
-  reference_basilar_membrane = basilar_membrane_add_noise(
-    reference_b, reference_noise, level1
+  reference_basilar_membrane = jnp.where(
+    valid_mask[None, :],
+    basilar_membrane_add_noise(reference_b, reference_noise, level1),
+    0.0,
   )
-  processed_basilar_membrane = basilar_membrane_add_noise(
-    processed_b, processed_noise, level1
+  processed_basilar_membrane = jnp.where(
+    valid_mask[None, :],
+    basilar_membrane_add_noise(processed_b, processed_noise, level1),
+    0.0,
   )
 
   if m_delay > 0:
@@ -615,10 +697,14 @@ def _ear_model_aligned(
       bandwidths=reference_bandwidth,
       centre_freq=centre_freq,
     )
-    reference_db = compensate(reference_db)
-    processed_db = compensate(processed_db)
-    reference_basilar_membrane = compensate(reference_basilar_membrane)
-    processed_basilar_membrane = compensate(processed_basilar_membrane)
+    reference_db = jnp.where(valid_mask[None, :], compensate(reference_db), 0.0)
+    processed_db = jnp.where(valid_mask[None, :], compensate(processed_db), 0.0)
+    reference_basilar_membrane = jnp.where(
+      valid_mask[None, :], compensate(reference_basilar_membrane), 0.0
+    )
+    processed_basilar_membrane = jnp.where(
+      valid_mask[None, :], compensate(processed_basilar_membrane), 0.0
+    )
 
   reference_sl = convert_rms_to_sl(
     reference_average,
@@ -646,6 +732,60 @@ def _ear_model_aligned(
     reference_sl,
     processed_sl,
   )
+
+
+def _pad_noise(noise, shape, dtype):
+  if noise is None:
+    return jnp.zeros(shape, dtype=dtype)
+  noise = jnp.asarray(noise, dtype=dtype)
+  pad = max(shape[1] - noise.shape[1], 0)
+  return jnp.pad(noise, ((0, 0), (0, pad)))[:, : shape[1]]
+
+
+def _run_ear_model(
+  reference,
+  reference_rate,
+  processed,
+  processed_rate,
+  hearing_loss,
+  itype,
+  level1,
+  nchan=32,
+  m_delay=1,
+  reference_noise=None,
+  processed_noise=None,
+):
+  dtype = jnp.result_type(reference, processed, jnp.float32)
+  reference_24k = resample_24khz(
+    jnp.asarray(reference, dtype=dtype), reference_rate
+  )
+  processed_24k = resample_24khz(
+    jnp.asarray(processed, dtype=dtype), processed_rate
+  )
+
+  shortest = min(reference_24k.shape[0], processed_24k.shape[0])
+  reference_24k, processed_24k, (start, stop, _) = input_align(
+    reference_24k[:shortest], processed_24k[:shortest]
+  )
+  valid_len = jnp.maximum(stop - start + 1, 0)
+
+  shape = (nchan, reference_24k.shape[0])
+  reference_noise = _pad_noise(reference_noise, shape, dtype)
+  processed_noise = _pad_noise(processed_noise, shape, dtype)
+
+  outputs = _ear_model_aligned(
+    reference_24k,
+    processed_24k,
+    jnp.asarray(hearing_loss, dtype=dtype),
+    itype,
+    level1,
+    reference_noise,
+    processed_noise,
+    nchan,
+    m_delay,
+    valid_len=valid_len,
+  )
+  return (*outputs, _SAMPLE_RATE, valid_len)
 
 
 def ear_model(
@@ -685,36 +825,17 @@ def ear_model(
     Envelope and BM motion per band for each signal, the long-term dB SL
     spectra, and the model sampling rate.
   """
-  dtype = jnp.result_type(reference, processed, jnp.float32)
-  reference_24k = resample_24khz(
-    jnp.asarray(reference, dtype=dtype), reference_rate
-  )
-  processed_24k = resample_24khz(
-    jnp.asarray(processed, dtype=dtype), processed_rate
-  )
-
-  shortest = min(reference_24k.shape[0], processed_24k.shape[0])
-  reference_24k, processed_24k, _ = input_align(
-    reference_24k[:shortest], processed_24k[:shortest]
-  )
-  reference_24k = jnp.asarray(reference_24k, dtype=dtype)
-  processed_24k = jnp.asarray(processed_24k, dtype=dtype)
-
-  shape = (nchan, reference_24k.shape[0])
-  if reference_noise is None:
-    reference_noise = jnp.zeros(shape, dtype=dtype)
-  if processed_noise is None:
-    processed_noise = jnp.zeros(shape, dtype=dtype)
-
-  outputs = _ear_model_aligned(
-    reference_24k,
-    processed_24k,
-    jnp.asarray(hearing_loss, dtype=dtype),
+  outputs = _run_ear_model(
+    reference,
+    reference_rate,
+    processed,
+    processed_rate,
+    hearing_loss,
     itype,
     level1,
-    jnp.asarray(reference_noise, dtype=dtype),
-    jnp.asarray(processed_noise, dtype=dtype),
-    nchan,
-    m_delay,
+    nchan=nchan,
+    m_delay=m_delay,
+    reference_noise=reference_noise,
+    processed_noise=processed_noise,
   )
-  return (*outputs, _SAMPLE_RATE)
+  return outputs[:7]

@@ -10,7 +10,12 @@ _SMALL = 1e-30
 
 
 def env_filter(
-  reference_db, processed_db, filter_cutoff, freq_sub_sample, freq_samp
+  reference_db,
+  processed_db,
+  filter_cutoff,
+  freq_sub_sample,
+  freq_samp,
+  valid_len=None,
 ):
   """Low-pass and subsample the dB SL envelopes.
 
@@ -20,6 +25,7 @@ def env_filter(
     filter_cutoff: LP cutoff in Hz.
     freq_sub_sample: Output sampling rate in Hz.
     freq_samp: Input sampling rate in Hz.
+    valid_len: Optional active sample count before subsampling.
 
   Returns:
     Both envelopes, low-passed and subsampled, shape (nsub, nbands).
@@ -54,13 +60,23 @@ def env_filter(
 
   def low_pass(envelope):
     padded = jnp.pad(envelope, ((len(taps) - 1, len(taps) - 1), (0, 0)))
-    convolved = jnp.apply_along_axis(
-      lambda column: jnp.convolve(column, taps, "valid"), 0, padded
-    )
+    convolved = jax.vmap(
+      lambda column: jnp.convolve(column, taps, "valid"),
+      in_axes=1,
+      out_axes=1,
+    )(padded)
     return convolved[nhalf : nhalf + nsamp]
 
-  index = np.arange(0, nsamp, int(freq_samp // freq_sub_sample))
-  return low_pass(reference_db)[index], low_pass(processed_db)[index]
+  step = int(freq_samp // freq_sub_sample)
+  index = jnp.arange(0, nsamp, step)
+  reference_lp = low_pass(reference_db)[index]
+  processed_lp = low_pass(processed_db)[index]
+  if valid_len is not None:
+    valid_sub = (index < valid_len)[:, None]
+    zero = jnp.zeros((), dtype=dtype)
+    reference_lp = jnp.where(valid_sub, reference_lp, zero)
+    processed_lp = jnp.where(valid_sub, processed_lp, zero)
+  return reference_lp, processed_lp
 
 
 def _cepstrum_basis(nbands, nbasis):
@@ -75,9 +91,9 @@ def cepstral_correlation_coef(
 ):
   """Mel cepstra of the samples that clear the silence threshold.
 
-  Numpy, not JAX: the gate keeps a data-dependent number of *time samples*,
-  and the modulation filterbank then convolves along that axis, so a mask is
-  not equivalent to the reference's selection.
+  Compacts the ``nkept`` active frames into ``[:nkept]`` and zero-pads the
+  remaining ``[nkept:nsamp]`` slots so the output shape stays fixed across
+  clips for XLA compilation.
 
   Args:
     reference_db: Subsampled reference envelope, shape (nsamp, nbands).
@@ -85,36 +101,57 @@ def cepstral_correlation_coef(
     thresh_cep: Loudness in dB above which a sample is kept.
     thresh_nerve: RMS of the IHC firing dither, in dB.
     nbasis: Number of cepstral basis functions.
-    noise: Dither for the two gated envelopes, each (nkept, nbands). The
-      reference draws it from the unseeded global RNG after the gate, so it is
-      shaped by the gate; None means no dither.
+    noise: Dither for the two gated envelopes, each (nkept, nbands) or
+      (nsamp, nbands); None means no dither.
 
   Returns:
-    Mean-removed cepstral coefficients for both signals, (nkept, nbasis).
+    Mean-removed cepstral coefficients for both signals, each (nsamp, nbasis),
+    and ``nkept`` (the number of active frames in ``[:nkept]``).
   """
-  dtype = np.dtype(jnp.result_type(reference_db, processed_db, jnp.float32))
-  reference_db = np.asarray(reference_db)
-  processed_db = np.asarray(processed_db)
-  nbands = reference_db.shape[1]
-  basis = _cepstrum_basis(nbands, nbasis)
+  dtype = jnp.result_type(reference_db, processed_db, jnp.float32)
+  reference_db = jnp.asarray(reference_db, dtype=dtype)
+  processed_db = jnp.asarray(processed_db, dtype=dtype)
+  nsamp, nbands = reference_db.shape
+  basis = jnp.asarray(_cepstrum_basis(nbands, nbasis), dtype=dtype)
 
-  loudness = np.sum(10 ** (reference_db / 20), axis=1) / nbands
-  loudness = 20 * np.log10(loudness)
-  keep = np.where(loudness > thresh_cep)[0]
-  if len(keep) <= 1:
-    raise ValueError("Signal below threshold")
+  loudness = (
+    jnp.sum(jnp.power(dtype.type(10.0), reference_db / 20), axis=1) / nbands
+  )
+  loudness = 20 * jnp.log10(jnp.maximum(loudness, dtype.type(_SMALL)))
+  keep_mask = loudness > thresh_cep
+  nkept = jnp.sum(keep_mask)
+  enough = nkept > 1
+  active = jnp.where(enough, nkept, 0)
 
-  reference_db = reference_db[keep, :]
-  processed_db = processed_db[keep, :]
+  order = jnp.argsort(~keep_mask, stable=True)
+  valid_pos = (jnp.arange(nsamp) < active)[:, None]
+  zero = jnp.zeros((), dtype=dtype)
+  reference_db = jnp.where(valid_pos, reference_db[order], zero)
+  processed_db = jnp.where(valid_pos, processed_db[order], zero)
+
   if noise is not None:
-    reference_db = reference_db + thresh_nerve * np.asarray(noise[0])
-    processed_db = processed_db + thresh_nerve * np.asarray(noise[1])
 
+    def _pad_noise(n):
+      n = jnp.asarray(n, dtype=dtype)
+      pad = max(0, nsamp - n.shape[0])
+      return jnp.pad(n[:nsamp], ((0, pad), (0, 0)))
+
+    dither = dtype.type(thresh_nerve)
+    reference_db = reference_db + jnp.where(
+      valid_pos, dither * _pad_noise(noise[0]), zero
+    )
+    processed_db = processed_db + jnp.where(
+      valid_pos, dither * _pad_noise(noise[1]), zero
+    )
+
+  denom = jnp.maximum(active, 1).astype(dtype)
   reference_cep = reference_db @ basis
   processed_cep = processed_db @ basis
-  reference_cep -= np.mean(reference_cep, axis=0, keepdims=True)
-  processed_cep -= np.mean(processed_cep, axis=0, keepdims=True)
-  return reference_cep.astype(dtype), processed_cep.astype(dtype)
+  ref_mean = jnp.sum(reference_cep, axis=0, keepdims=True) / denom
+  proc_mean = jnp.sum(processed_cep, axis=0, keepdims=True) / denom
+  reference_cep = jnp.where(valid_pos, reference_cep - ref_mean, zero)
+  processed_cep = jnp.where(valid_pos, processed_cep - proc_mean, zero)
+  return reference_cep, processed_cep, active
 
 
 def _modulation_filters(freq_sub_sampling, centre_frequencies):
@@ -212,12 +249,15 @@ def fir_modulation_filter(
   )
 
 
-def modulation_cross_correlation(reference_modulation, processed_modulation):
+def modulation_cross_correlation(
+  reference_modulation, processed_modulation, nkept=None
+):
   """Normalised cross-covariance per band, averaged over basis functions 2-6.
 
   Args:
     reference_modulation: Shape (nchan, nmod, nsamp).
     processed_modulation: Same shape.
+    nkept: Optional active frame count in ``[0, nsamp]``.
 
   Returns:
     One correlation per modulation band.
@@ -227,17 +267,25 @@ def modulation_cross_correlation(reference_modulation, processed_modulation):
   )
   reference_modulation = jnp.asarray(reference_modulation, dtype=dtype)
   processed_modulation = jnp.asarray(processed_modulation, dtype=dtype)
-  reference = reference_modulation - jnp.mean(
-    reference_modulation, axis=2, keepdims=True
-  )
-  processed = processed_modulation - jnp.mean(
-    processed_modulation, axis=2, keepdims=True
-  )
+  nsamp = reference_modulation.shape[2]
+  if nkept is None:
+    nkept = nsamp
+  enough = nkept > 1
+  active = jnp.where(enough, nkept, 0)
+  denom = jnp.maximum(active, 1).astype(dtype)
+  mask = (jnp.arange(nsamp) < active)[None, None, :]
+  zero = jnp.zeros((), dtype=dtype)
+
+  ref_masked = jnp.where(mask, reference_modulation, zero)
+  proc_masked = jnp.where(mask, processed_modulation, zero)
+  ref_mean = jnp.sum(ref_masked, axis=2, keepdims=True) / denom
+  proc_mean = jnp.sum(proc_masked, axis=2, keepdims=True) / denom
+  reference = jnp.where(mask, ref_masked - ref_mean, zero)
+  processed = jnp.where(mask, proc_masked - proc_mean, zero)
 
   reference_sum = jnp.sum(reference**2, axis=2)
   processed_sum = jnp.sum(processed**2, axis=2)
   valid = (reference_sum >= _SMALL) & (processed_sum >= _SMALL)
-  zero = jnp.zeros((), dtype=dtype)
   one = jnp.ones((), dtype=dtype)
   covariance = jnp.where(
     valid,
@@ -245,4 +293,4 @@ def modulation_cross_correlation(reference_modulation, processed_modulation):
     / jnp.sqrt(jnp.where(valid, reference_sum * processed_sum, one)),
     zero,
   )
-  return jnp.mean(covariance[1:6], axis=0)
+  return jnp.where(enough, jnp.mean(covariance[1:6], axis=0), zero)

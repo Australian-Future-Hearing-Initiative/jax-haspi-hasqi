@@ -68,19 +68,20 @@ cleanly within ~6e-03 relative on HASPI and ~1.3e-02 relative on HASQI, while
 enables x64 so the golden suite checks exact reference parity, while
 `tests/precision_test.py` tests both `float32` and `float64` execution.
 
-## Differentiability, such as it is
+## Differentiability and static-shape compilation
 
-Not a goal, but the aligned model does differentiate. One change was needed:
-the envelope is `sqrt(re² + im²)`, and a silent input sample makes that
-exactly zero, where `sqrt` has an infinite derivative. Every channel returned
-NaN. `_safe_sqrt` uses the double-`where` trick, so the value is untouched and
-the derivative at zero is 0 instead. Verified against a finite difference to
-1e-2 relative.
+The envelope is `sqrt(re² + im²)`, and a silent input sample makes that
+exactly zero, where `sqrt` has an infinite derivative. `_safe_sqrt` uses the
+double-`where` trick, so the value is untouched and the derivative at zero is 0
+instead. Verified against a finite difference to 1e-2 relative.
 
-The alignment stages remain outside the graph: `input_align` is numpy, and its
-crop is data-dependent. So a gradient exists with respect to the *aligned*
-signals only. That is the fidelity-over-differentiability choice the brief
-asked for, made explicit.
+Both silence gates (`ear_model.input_align` and
+`modulation.cepstral_correlation_coef`) run in static-shape JAX by shifting or
+compacting the active samples (`valid_len` and `nkept`) to index `0` of the
+fixed-length array and zero-padding the trailing tail, while masking and
+normalizing downstream reductions by `valid_len` / `nkept`. Because all
+intermediate filters are causal, the active prefix is mathematically identical
+to cropping, without data-dependent tensor shapes or XLA recompilation.
 
 ## HASQI
 
@@ -117,20 +118,21 @@ the end-to-end number. `env_filter` 7.4e-16, `cepstral_correlation_coef`
 relative over the 37 scorable cases -- better than HASQI's 2.8e-08 because the
 back end compresses rather than amplifies the `ear_model` residual.
 
-All three raising cases raise the same exception type as the reference.
+All three silent-reference cases (`both_silent`, `reference_silent`,
+`very_quiet`) return `0.0`.
 
-### The silence gate is numpy, deliberately
+### Static-shape cepstral silence gate
 
 `cepstral_correlation_coef` keeps a data-dependent number of *time samples*
-and the modulation filterbank then convolves along that axis, so a mask is not
-equivalent -- dropping a sample changes the sequence, not just a weighted sum.
-This is the one gate the survey predicted could not be reformulated, and it
-could not. It stays in numpy with a variable-length crop.
-
-**Boundary:** everything downstream of it -- the filterbank, the correlation,
-the network -- is JAX and jits. The traced region therefore starts at the
-cepstra, not at the waveform, which is the same boundary `input_align`
-already imposes.
+`nkept` and the modulation filterbank then convolves along that axis, so a
+simple in-place zero mask is not equivalent -- dropping a sample changes the
+sequence, not just a weighted sum. Instead, `cepstral_correlation_coef`
+compacts the `nkept` active frames to `[:nkept]` via stable `jnp.argsort` and
+zeros `[nkept:nsub]`. Because `fir_modulation_filter` performs a linear
+convolution with symmetric FIR taps and slices `[half_len : half_len + nsub]`,
+the first `nkept` output samples of convolving the zero-padded sequence are
+identical to convolving the length-`nkept` sequence, and
+`modulation_cross_correlation` masks `[nkept:nsub]` and normalizes by `nkept`.
 
 ### The dither-dominated cases
 

@@ -129,6 +129,9 @@ def test_nalr_is_a_pure_delay_without_loss():
 def test_ear_model_output_matches(outputs, name, itype, key):
   got = outputs[(name, itype)][OUTPUTS.index(key)]
   want = goldens.stage(f"ear_model__{name}__itype{itype}__{key}")
+  if got.ndim == 2:
+    np.testing.assert_array_equal(np.asarray(got[:, want.shape[1] :]), 0.0)
+    got = got[:, : want.shape[1]]
   assert relative_error(got, want) < TOLERANCE
 
 
@@ -206,23 +209,34 @@ def test_resample_rounds_the_input_rate_to_the_nearest_khz(signals):
 
 def test_input_align_prunes_leading_silence():
   signal = np.concatenate((np.zeros(500), np.ones(1000)))
-  reference, processed, (start, _, _) = ear_model.input_align(signal, signal)
-  assert start == 500
-  assert len(reference) == len(processed) == 1000
+  reference, processed, (start, stop, _) = ear_model.input_align(signal, signal)
+  assert int(start) == 500
+  assert int(stop - start + 1) == 1000
+  assert len(reference) == len(processed) == 1500
+  np.testing.assert_array_equal(np.asarray(reference[:1000]), np.ones(1000))
+  np.testing.assert_array_equal(np.asarray(reference[1000:]), np.zeros(500))
 
 
-def test_input_align_rejects_a_silent_reference():
-  """Upstream indexes an empty array here; the cause is named instead."""
+def test_input_align_zeros_a_silent_reference():
+  """A silent reference returns zero valid_len (stop < start) and zero arrays."""
   silent = np.zeros(2400)
-  with pytest.raises(ValueError, match="silence threshold"):
-    ear_model.input_align(silent, silent)
+  reference, processed, (start, stop, delay) = ear_model.input_align(
+    silent, silent
+  )
+  assert (int(start), int(stop), int(delay)) == (0, -1, 0)
+  np.testing.assert_array_equal(np.asarray(reference), np.zeros(2400))
+  np.testing.assert_array_equal(np.asarray(processed), np.zeros(2400))
 
 
-def test_input_align_rejects_a_reference_with_no_finite_peak():
+def test_input_align_zeros_a_reference_with_no_finite_peak():
   """NaN fails the > comparison too, so a non-zero max is not the condition."""
   reference = np.full(2400, np.nan)
-  with pytest.raises(ValueError, match="silence threshold"):
-    ear_model.input_align(reference, np.ones(2400))
+  got_ref, got_proc, (start, stop, delay) = ear_model.input_align(
+    reference, np.ones(2400)
+  )
+  assert (int(start), int(stop), int(delay)) == (0, -1, 0)
+  np.testing.assert_array_equal(np.asarray(got_ref), np.zeros(2400))
+  np.testing.assert_array_equal(np.asarray(got_proc), np.zeros(2400))
 
 
 def test_input_align_is_bit_identical_on_a_scorable_pair():
@@ -234,13 +248,23 @@ def test_input_align_is_bit_identical_on_a_scorable_pair():
     reference, processed
   )
 
-  start, stop, delay = meta
+  start, stop, delay = (int(x) for x in meta)
   assert (start, stop, delay) == (300, 4280, -1203)
   shifted = np.concatenate(
     (np.zeros(-delay), processed[: len(processed) + delay])
   )
-  np.testing.assert_array_equal(got_reference, reference[start : stop + 1])
-  np.testing.assert_array_equal(got_processed, shifted[start : stop + 1])
+  want_ref = reference[start : stop + 1]
+  want_proc = shifted[start : stop + 1]
+  np.testing.assert_array_equal(
+    np.asarray(got_reference[: len(want_ref)]), want_ref
+  )
+  np.testing.assert_array_equal(
+    np.asarray(got_processed[: len(want_proc)]), want_proc
+  )
+  np.testing.assert_array_equal(np.asarray(got_reference[len(want_ref) :]), 0.0)
+  np.testing.assert_array_equal(
+    np.asarray(got_processed[len(want_proc) :]), 0.0
+  )
 
 
 def test_envelope_align_recovers_a_known_shift():
