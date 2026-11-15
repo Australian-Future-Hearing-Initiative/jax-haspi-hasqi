@@ -177,7 +177,7 @@ def test_in_float64_restores_the_previous_setting():
     assert not jax.config.jax_enable_x64
 
 
-def test_in_float64_is_a_no_op_when_already_enabled():
+def test_in_float64_keeps_x64_enabled_when_already_enabled():
   assert jax.config.jax_enable_x64
 
   @precision.in_float64
@@ -205,8 +205,9 @@ def test_require_x64_still_available_for_callers_who_want_it():
   precision.require_x64()
 
   with jax.enable_x64(False):
-    with pytest.raises(RuntimeError, match="requires float64"):
+    with pytest.raises(RuntimeError, match="requires float64") as exc_info:
       precision.require_x64()
+    assert "precision.in_float64" in str(exc_info.value)
 
 
 def test_in_float64_promotes_metric_inputs_when_x64_is_enabled():
@@ -321,6 +322,9 @@ def test_in_float64_promotes_nested_and_preserves_non_floating(x64_before):
 
   opaque = _Opaque()
   arr64_np = np.array([1.0], dtype=np.float64)
+  arr_c128_np = np.array([1.0 + 2.0j], dtype=np.complex128)
+  arr64_jnp = jnp.array([1.0], dtype=jnp.float64)
+  arr_c128_jnp = jnp.array([1.0 + 2.0j], dtype=jnp.complex128)
   arr_i32_np = np.array([1, 2], dtype=np.int32)
 
   with jax.enable_x64(x64_before):
@@ -334,6 +338,9 @@ def test_in_float64_promotes_nested_and_preserves_non_floating(x64_before):
       np.array([1.0], dtype=np.float32),
       arr32_jnp,
       arr64_np,
+      arr_c128_np,
+      arr64_jnp,
+      arr_c128_jnp,
       np.float32(2.5),
       np.complex64(1.0 + 2.0j),
       24000,
@@ -361,19 +368,22 @@ def test_in_float64_promotes_nested_and_preserves_non_floating(x64_before):
   assert isinstance(a[0], np.ndarray) and a[0].dtype == np.float64
   assert isinstance(a[1], jax.Array) and a[1].dtype == jnp.float64
   assert a[2] is arr64_np
-  assert isinstance(a[3], np.float64) and a[3] == 2.5
-  assert isinstance(a[4], np.complex128) and a[4] == 1.0 + 2.0j
-  assert a[5] == 24000 and type(a[5]) is int
-  assert a[6] is True
-  assert a[7] == 65.0 and type(a[7]) is float
-  assert a[8] == "label"
-  assert a[9] is None
-  assert isinstance(a[10], np.int32) and a[10] == 7
-  assert isinstance(a[11], np.bool_) and not a[11]
-  assert a[12] is arr_i32_np
-  assert a[13] is arr_i32_jnp
-  assert a[14] is arr_bool_jnp
-  assert a[15] is opaque
+  assert a[3] is arr_c128_np
+  assert a[4] is arr64_jnp
+  assert a[5] is arr_c128_jnp
+  assert isinstance(a[6], np.float64) and a[6] == 2.5
+  assert isinstance(a[7], np.complex128) and a[7] == 1.0 + 2.0j
+  assert a[8] == 24000 and type(a[8]) is int
+  assert a[9] is True
+  assert a[10] == 65.0 and type(a[10]) is float
+  assert a[11] == "label"
+  assert a[12] is None
+  assert isinstance(a[13], np.int32) and a[13] == 7
+  assert isinstance(a[14], np.bool_) and not a[14]
+  assert a[15] is arr_i32_np
+  assert a[16] is arr_i32_jnp
+  assert a[17] is arr_bool_jnp
+  assert a[18] is opaque
 
   nested = seen["kwargs"]["nested"]
   assert isinstance(nested["tuple"], tuple)
@@ -387,21 +397,22 @@ def test_in_float64_promotes_nested_and_preserves_non_floating(x64_before):
   assert nested["named"].b == 4 and type(nested["named"].b) is int
 
 
-def test_in_float64_with_jit():
-  """`in_float64` composes with `jax.jit` as outer or (under x64) inner wrap."""
+def test_in_float64_with_jax_transforms():
+  """`in_float64` wraps `jax.jit`/`jax.grad`, and nests inside `jit` under x64."""
 
   def fn(x):
-    return x + jnp.asarray(1.0)
+    return x * x + jnp.asarray(1.0)
 
   wrapped_jit = precision.in_float64(jax.jit(fn))
+  wrapped_grad = precision.in_float64(jax.grad(fn))
   with jax.enable_x64(False):
     out = wrapped_jit(jnp.float32(2.0))
+    grad = wrapped_grad(jnp.float32(2.0))
     assert not jax.config.jax_enable_x64
-  assert out.dtype == jnp.float64
-  assert float(out) == 3.0
+  assert out.dtype == jnp.float64 and float(out) == 5.0
+  assert grad.dtype == jnp.float64 and float(grad) == 4.0
 
   assert jax.config.jax_enable_x64
   jitted_wrapped = jax.jit(precision.in_float64(fn))
   out2 = jitted_wrapped(jnp.float32(2.0))
-  assert out2.dtype == jnp.float64
-  assert float(out2) == 3.0
+  assert out2.dtype == jnp.float64 and float(out2) == 5.0

@@ -62,13 +62,15 @@ def in_float64(fn):
   setting on exit, and promotes floating-point (`float64`) and complex
   (`complex128`) array/scalar inputs in `*args` and `**kwargs` (including
   nested pytrees) before calling `fn`, even when `jax_enable_x64` is already
-  enabled. Non-floating arguments are left unchanged.
+  enabled. Non-floating arguments are left unchanged (integer PCM arrays must
+  be cast to float first).
 
   The jit cache survives the toggle, so this costs nothing after the first
   call for a given shape: 2.04 s cold, then 0.18 s and 0.17 s warm, measured
-  from a float32 process. When combining with an outer `jax.jit` from a
-  float32 process, wrap the jitted callable (`in_float64(jax.jit(fn))`), as
-  JAX does not support enabling x64 mid-trace.
+  from a float32 process. When combining with outer JAX transforms (`jax.jit`,
+  `jax.grad`, etc.) from a float32 process, wrap the transformed callable
+  (`in_float64(jax.jit(fn))`, `in_float64(jax.grad(fn))`), since enabling x64
+  inside a trace does not persist across JAX tracing or reverse passes.
 
   Args:
     fn: The function to wrap.
@@ -94,12 +96,14 @@ def require_x64():
   and preserve the caller's input dtype instead.
 
   Raises:
-    RuntimeError: If x64 is disabled, naming both ways to enable it.
+    RuntimeError: If x64 is disabled, naming how to enable it.
   """
   if not jax.config.jax_enable_x64:
     raise RuntimeError(
       "jax-haspi-hasqi requires float64. Enable it globally with "
-      "jax.config.update('jax_enable_x64', True), or scope it to the call "
-      "with `with jax.enable_x64(True):`. float32 does run, but agrees with "
-      "the reference only to about 1% rather than 1e-09."
+      "jax.config.update('jax_enable_x64', True), scope it with "
+      "`with jax.enable_x64(True):` (with float64 inputs), or wrap the call "
+      "with `precision.in_float64` to also promote float32 inputs. float32 "
+      "does run, but drifts up to ~1.9e-2 on real speech rather than ~2.8e-8 "
+      "relative in float64."
     )
