@@ -811,9 +811,13 @@ def ear_model(
     hearing_loss: Audiometric thresholds in dB HL at [250, 500, 1000, 2000,
       4000, 6000] Hz. The caller must resample/interpolate other frequencies to
       these six values before calling.
-    itype: 0 intelligibility, 1 quality with NAL-R added here, 2 quality with
-      NAL-R already applied to the reference.
-    level1: dB SPL corresponding to an RMS of 1.
+    itype: 0 intelligibility (normal-hearing reference ear, impaired processed
+      ear); 1 quality with 24 kHz NAL-R added to ``reference`` only (expects
+      aided ``processed``, e.g. via ``calibration.apply_nalr_24khz``); 2
+      quality with no NAL-R added here (unaided or pre-equalised reference).
+    level1: dB SPL corresponding to ``rms(reference) == 1.0``. Jointly scale
+      ``(reference, processed)`` first (e.g. ``calibration.scale_to_spl``) when
+      scoring ``[-1, 1]`` audio.
     nchan: Number of auditory bands.
     m_delay: Compensate the filter bank's inter-channel group delay.
     reference_noise: Unit-variance threshold noise, shape (nchan, nsamp).

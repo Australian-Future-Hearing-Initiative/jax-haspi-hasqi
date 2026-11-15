@@ -125,5 +125,10 @@ def build(hearing_loss, n_fir=140, sample_rate=24000.0):
 
 
 def apply(nalr, signal):
-  """Convolve a signal with a built NAL-R filter."""
+  """Convolve a signal with a built NAL-R filter.
+
+  Returns the full convolution (length ``len(signal) + len(nalr) - 1`` with
+  group delay ``(len(nalr) - 1) // 2``). For 24 kHz zero-delay aided evaluation
+  matching ``ear_model``, see ``calibration.apply_nalr_24khz``.
+  """
   return jnp.convolve(signal, nalr)

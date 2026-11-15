@@ -30,6 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from jax_haspi_hasqi import calibration
 from jax_haspi_hasqi import goldens
 from jax_haspi_hasqi import haspi
 from jax_haspi_hasqi import hasqi
@@ -134,6 +135,19 @@ def test_the_nalr_design_emits_no_float64_transform():
   """The filter design is the one FFT the metrics reach outside a correlation."""
   with captured_lowerings() as modules:
     jax.block_until_ready(nalr.build(jnp.asarray(levels("clinical"))))
+
+  assert_single_precision_transforms(modules)
+
+
+def test_apply_nalr_24khz_emits_no_float64_transform():
+  reference = jnp.asarray(goldens.stage("reference_signal"))
+  jitted = jax.jit(
+    calibration.apply_nalr_24khz, static_argnames=("sample_rate",)
+  )
+  with captured_lowerings() as modules:
+    jax.block_until_ready(
+      jitted(reference, 16000, jnp.asarray(levels("clinical")))
+    )
 
   assert_single_precision_transforms(modules)
 

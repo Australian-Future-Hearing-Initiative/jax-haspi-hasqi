@@ -478,8 +478,13 @@ def hasqi_v2(
     hearing_loss: Audiometric thresholds in dB HL at [250, 500, 1000, 2000,
       4000, 6000] Hz. The caller must resample/interpolate other frequencies to
       these six values before calling (e.g. log-frequency interpolation).
-    equalisation: 1 to apply NAL-R to the reference here, 2 if it already has it.
-    level1: dB SPL corresponding to an RMS of 1.
+    equalisation: 1 to apply 24 kHz NAL-R to ``reference`` only (for aided
+      evaluation where ``processed`` already carries hearing-aid gain, e.g. via
+      ``calibration.apply_nalr_24khz``); 2 to skip NAL-R on ``reference`` (for
+      unaided evaluation or when both signals are already equalised).
+    level1: dB SPL corresponding to ``rms(reference) == 1.0``. Standard
+      ``[-1, 1]`` speech (~-20 to -25 dBFS) silently evaluates at ~40-45 dB SPL
+      unless jointly scaled first (see ``calibration.scale_to_spl``).
     silence_threshold: dB SL below which a time-frequency tile is ignored.
     segment_covariance: Segment size in ms.
     reference_noise: Threshold noise for the reference's BM motion.

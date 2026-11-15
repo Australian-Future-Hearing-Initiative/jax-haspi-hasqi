@@ -33,6 +33,38 @@ interpolate first — on a log-frequency axis, as
 `clarity.utils.audiogram.Audiogram.resample` does. A 6 kHz-vs-8 kHz mismatch is
 silent and can reach 10 dB in the top band.
 
+**Level calibration is the caller's responsibility.** `level1=65.0` assumes
+`rms(reference) == 1.0` corresponds to 65 dB SPL, matching `pyclarity==0.9.0`.
+Standard `[-1, 1]` speech sits around −20 to −25 dBFS (RMS ~0.06–0.10), which
+silently evaluates at ~40–45 dB SPL — saturating normal-hearing HASPI near 1.0
+and scrambling model rankings. Jointly scale `(reference, processed)` with
+`calibration.scale_to_spl` so `rms(reference) == 1.0` while preserving relative
+gain and SNR.
+
+**Aided vs. unaided evaluation for impaired audiograms.** `hasqi_v2` defaults
+to `equalisation=1`, which applies 24 kHz NAL-R equalisation to `reference`
+only (assuming `processed` already comes from a hearing aid); `haspi_v2`
+likewise passes `processed` through the impaired ear against a normal-hearing
+reference. Evaluating a non-hearing-aid speech enhancer without NAL-R gain on
+`processed` collapses impaired scores due to gain mismatch:
+
+```python
+from jax_haspi_hasqi import calibration, haspi, hasqi
+
+# Scale jointly so rms(reference) == 1.0 (65 dB SPL at level1=65.0).
+ref, proc = calibration.scale_to_spl(reference, processed)
+
+# Unaided: normal hearing, or impaired quality without hearing-aid gain.
+quality_unaided, *_ = hasqi.hasqi_v2(
+  ref, sample_rate, proc, sample_rate, levels, equalisation=2
+)
+
+# Aided: apply 24 kHz 140-tap NAL-R to processed (output is at 24000 Hz).
+proc_aided = calibration.apply_nalr_24khz(proc, sample_rate, levels)
+score, _ = haspi.haspi_v2(ref, sample_rate, proc_aided, 24000, levels)
+quality, *_ = hasqi.hasqi_v2(ref, sample_rate, proc_aided, 24000, levels)
+```
+
 > [!NOTE]
 > **Precision follows the caller's dtype.** In a default `float32` JAX process
 > (or when given `float32` inputs), both metrics execute in `float32` on CPU,

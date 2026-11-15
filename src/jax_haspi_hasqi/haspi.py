@@ -86,12 +86,17 @@ def haspi_v2(
   Args:
     reference: Clean reference signal, without amplification.
     reference_rate: Its sampling rate in Hz.
-    processed: Processed signal.
+    processed: Processed signal. Scored through the impaired ear against a
+      normal-hearing reference; for aided evaluation of non-hearing-aid
+      enhancers on impaired audiograms, apply ``calibration.apply_nalr_24khz``
+      first (and pass ``processed_rate=24000``).
     processed_rate: Its sampling rate in Hz.
     hearing_loss: Audiometric thresholds in dB HL at [250, 500, 1000, 2000,
       4000, 6000] Hz. The caller must resample/interpolate other frequencies to
       these six values before calling (e.g. log-frequency interpolation).
-    level1: dB SPL corresponding to an RMS of 1.
+    level1: dB SPL corresponding to ``rms(reference) == 1.0``. Standard
+      ``[-1, 1]`` speech (~-20 to -25 dBFS) silently evaluates at ~40-45 dB SPL
+      unless jointly scaled first (see ``calibration.scale_to_spl``).
     f_lp: Envelope low-pass cutoff in Hz.
     itype: Passed to the ear model; 0 for intelligibility.
     reference_noise: Threshold noise for the reference's BM motion.
@@ -137,7 +142,11 @@ def haspi_v2_better_ear(
   hearing_loss_right,
   level=100.0,
 ):
-  """HASPI for the better of the two ears."""
+  """HASPI for the better of the two ears.
+
+  ``level`` is the dB SPL corresponding to ``rms(reference) == 1.0`` (default
+  100.0 dB SPL; see ``calibration.scale_to_spl`` to scale to a target SPL).
+  """
   left, _ = haspi_v2(
     reference_left,
     sample_rate,
