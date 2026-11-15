@@ -39,7 +39,10 @@ Standard `[-1, 1]` speech sits around −20 to −25 dBFS (RMS ~0.06–0.10), wh
 silently evaluates at ~40–45 dB SPL — saturating normal-hearing HASPI near 1.0
 and scrambling model rankings. Jointly scale `(reference, processed)` with
 `calibration.scale_to_spl` so `rms(reference) == 1.0` while preserving relative
-gain and SNR.
+gain and SNR. `scale_to_spl` uses whole-clip RMS, so callers padding clips to a
+fixed length for static-shape compilation must calibrate *before* zero-padding
+(otherwise active speech is boosted by `+10 log10(total / active)` dB SPL; long
+silence stretches have the same effect).
 
 **Aided vs. unaided evaluation for impaired audiograms.** `hasqi_v2` defaults
 to `equalisation=1`, which applies 24 kHz NAL-R equalisation to `reference`

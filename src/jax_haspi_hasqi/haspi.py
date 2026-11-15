@@ -145,7 +145,13 @@ def haspi_v2_better_ear(
   """HASPI for the better of the two ears.
 
   ``level`` is the dB SPL corresponding to ``rms(reference) == 1.0`` (default
-  100.0 dB SPL; see ``calibration.scale_to_spl`` to scale to a target SPL).
+  100.0 dB SPL; use ``calibration.scale_to_spl(..., target_spl=65.0,
+  level1=100.0)`` to score at 65 dB SPL under this default). Because a single
+  ``sample_rate`` is shared by all four signals, callers using
+  ``calibration.apply_nalr_24khz`` on non-24 kHz audio must also resample
+  ``reference_left`` and ``reference_right`` to 24 kHz (e.g. via
+  ``ear_model.resample_24khz``) and pass ``sample_rate=24000``, or call
+  ``haspi_v2`` per ear.
   """
   left, _ = haspi_v2(
     reference_left,

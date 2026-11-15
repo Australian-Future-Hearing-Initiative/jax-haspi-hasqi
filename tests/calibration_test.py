@@ -139,7 +139,46 @@ def test_metrics_are_scale_invariant_after_scale_to_spl():
     assert hq == pytest.approx(base_hq, rel=1e-10)
 
 
-def test_scale_to_spl_handles_silent_and_nonfinite_reference_safely():
+def test_model_sample_rate_is_int_and_shares_jit_cache_with_24000():
+  assert isinstance(calibration.MODEL_SAMPLE_RATE, int)
+  assert calibration.MODEL_SAMPLE_RATE == 24000
+
+  signal = jnp.asarray(_speech_like(duration=0.1, pad=0.0))
+  levels = jnp.asarray(_levels("clinical"))
+  jitted = jax.jit(
+    calibration.apply_nalr_24khz, static_argnames=("sample_rate",)
+  )
+  jitted(signal, 24000, levels)
+  jitted(signal, calibration.MODEL_SAMPLE_RATE, levels)
+  assert jitted._cache_size() == 1
+
+
+def test_scale_to_spl_rejects_non_1d_but_supports_vmap():
+  batch_ref = jnp.ones((2, 100), dtype=jnp.float64)
+  batch_proc = jnp.ones((2, 100), dtype=jnp.float64) * 0.5
+
+  with pytest.raises(ValueError, match="1-D"):
+    calibration.scale_to_spl(batch_ref, batch_proc)
+  with pytest.raises(ValueError, match="1-D"):
+    calibration.scale_to_spl(jnp.ones(100), batch_proc)
+  with pytest.raises(ValueError, match="1-D"):
+    calibration.scale_to_spl(jnp.asarray(1.0), jnp.ones(10))
+
+  r_batched, p_batched = jax.vmap(calibration.scale_to_spl)(
+    batch_ref * jnp.array([[0.1], [2.0]]), batch_proc
+  )
+  assert r_batched.shape == (2, 100)
+  np.testing.assert_allclose(
+    np.asarray(jnp.sqrt(jnp.mean(r_batched**2, axis=1))), 1.0, rtol=1e-12
+  )
+  np.testing.assert_allclose(
+    np.asarray(jnp.sqrt(jnp.mean(p_batched**2, axis=1))),
+    np.array([5.0, 0.25]),
+    rtol=1e-12,
+  )
+
+
+def test_scale_to_spl_handles_silent_empty_nonfinite_and_extreme_inputs():
   silent = jnp.zeros(1000, dtype=jnp.float64)
   proc = jnp.ones(1000, dtype=jnp.float64) * 0.25
 
@@ -149,6 +188,12 @@ def test_scale_to_spl_handles_silent_and_nonfinite_reference_safely():
   np.testing.assert_array_equal(np.asarray(ref_s), np.zeros(1000))
   np.testing.assert_array_equal(np.asarray(proc_s), np.asarray(proc))
 
+  # Empty reference returns empty reference and unchanged processed.
+  empty = jnp.zeros(0, dtype=jnp.float64)
+  ref_e, proc_e = calibration.scale_to_spl(empty, proc)
+  assert ref_e.shape == (0,)
+  np.testing.assert_array_equal(np.asarray(proc_e), np.asarray(proc))
+
   # Float32 subnormal square underflows to zero without producing NaN or Inf.
   tiny = jnp.full(100, 1e-25, dtype=jnp.float32)
   ref_t, proc_t = calibration.scale_to_spl(tiny, jnp.ones(100, jnp.float32))
@@ -156,11 +201,25 @@ def test_scale_to_spl_handles_silent_and_nonfinite_reference_safely():
   assert bool(jnp.all(jnp.isfinite(ref_t)))
   assert bool(jnp.all(jnp.isfinite(proc_t)))
 
-  # Non-finite reference leaves finite processed unpolluted.
-  inf_ref = jnp.array([jnp.inf, 1.0, 2.0], dtype=jnp.float64)
+  # Inf and NaN references leave finite processed unpolluted.
   fin_proc = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float64)
-  _, proc_i = calibration.scale_to_spl(inf_ref, fin_proc)
-  np.testing.assert_array_equal(np.asarray(proc_i), np.asarray(fin_proc))
+  for bad_val in (jnp.inf, jnp.nan):
+    bad_ref = jnp.array([bad_val, 1.0, 2.0], dtype=jnp.float64)
+    _, proc_out = calibration.scale_to_spl(bad_ref, fin_proc)
+    np.testing.assert_array_equal(np.asarray(proc_out), np.asarray(fin_proc))
+
+  # Extreme or NaN target_spl that would overflow leaves inputs finite.
+  unit = jnp.ones(16, dtype=jnp.float32) * 0.25
+  for bad_spl in (1000.0, jnp.nan):
+    r_ex, p_ex = calibration.scale_to_spl(unit, unit, target_spl=bad_spl)
+    np.testing.assert_array_equal(np.asarray(r_ex), np.asarray(unit))
+    np.testing.assert_array_equal(np.asarray(p_ex), np.asarray(unit))
+
+  # Quotient overflow (finite target_rms / tiny finite rms) falls back safely.
+  small32 = jnp.full(16, 1e-12, dtype=jnp.float32)
+  r_ov, p_ov = calibration.scale_to_spl(small32, unit, target_spl=665.0)
+  np.testing.assert_array_equal(np.asarray(r_ov), np.asarray(small32))
+  np.testing.assert_array_equal(np.asarray(p_ov), np.asarray(unit))
 
 
 def test_scale_to_spl_preserves_caller_dtype():
@@ -169,6 +228,25 @@ def test_scale_to_spl_preserves_caller_dtype():
 
   r32, p32 = calibration.scale_to_spl(jnp.float32(ref), jnp.float32(proc))
   assert r32.dtype == p32.dtype == jnp.float32
+
+  # Non-default Python float and float64 level args must not promote float32.
+  r32_py, p32_py = calibration.scale_to_spl(
+    jnp.float32(ref), jnp.float32(proc), target_spl=72.5, level1=100.0
+  )
+  assert r32_py.dtype == p32_py.dtype == jnp.float32
+  r32_64, p32_64 = calibration.scale_to_spl(
+    jnp.float32(ref),
+    jnp.float32(proc),
+    target_spl=jnp.float64(72.5),
+    level1=jnp.float64(100.0),
+  )
+  assert r32_64.dtype == p32_64.dtype == jnp.float32
+
+  # int16 PCM waveforms promote to float32 without int16 square overflow.
+  pcm = np.array([-16384, 0, 16384, 8192], dtype=np.int16)
+  rpcm, ppcm = calibration.scale_to_spl(pcm, pcm)
+  assert rpcm.dtype == ppcm.dtype == jnp.float32
+  assert float(jnp.sqrt(jnp.mean(rpcm**2))) == pytest.approx(1.0, rel=1e-6)
 
   r64, p64 = calibration.scale_to_spl(jnp.float64(ref), jnp.float64(proc))
   assert r64.dtype == p64.dtype == jnp.float64
@@ -211,13 +289,64 @@ def test_scale_to_spl_is_jittable_and_differentiable():
   )
   assert float(grad_spl) == pytest.approx(float(fd_spl), rel=1e-5)
 
-  # Silent reference must have finite gradients (double-where guard).
-  zeros = jnp.zeros_like(ref)
-  gz_r, gz_p = jax.grad(lambda r, p: loss(r, p, 65.0), argnums=(0, 1))(
-    zeros, proc
+  # Silent, inf, nan, and overflowing inputs must keep gradients finite.
+  def proc_loss(r, p, spl):
+    _, ps = calibration.scale_to_spl(r, p, target_spl=spl)
+    return jnp.sum(ps)
+
+  for bad_ref, spl in (
+    (jnp.zeros_like(ref), 65.0),
+    (ref.at[0].set(jnp.inf), 65.0),
+    (ref.at[0].set(jnp.nan), 65.0),
+    (ref, 1e4),
+  ):
+    gr, gp, gs = jax.grad(proc_loss, argnums=(0, 1, 2))(bad_ref, proc, spl)
+    assert bool(jnp.all(jnp.isfinite(gr)))
+    assert bool(jnp.all(jnp.isfinite(gp)))
+    assert bool(jnp.isfinite(gs))
+
+  # Empty reference gradient stays finite.
+  ge_r, ge_p = jax.grad(lambda r, p: proc_loss(r, p, 65.0), argnums=(0, 1))(
+    jnp.zeros(0, dtype=jnp.float64), proc
   )
-  assert bool(jnp.all(jnp.isfinite(gz_r)))
-  assert bool(jnp.all(jnp.isfinite(gz_p)))
+  assert ge_r.shape == (0,)
+  assert bool(jnp.all(jnp.isfinite(ge_p)))
+
+  # Float32 quotient-overflow gradient stays finite.
+  g32_r, g32_p, g32_s = jax.grad(proc_loss, argnums=(0, 1, 2))(
+    jnp.full(16, 1e-12, dtype=jnp.float32),
+    jnp.ones(16, dtype=jnp.float32),
+    jnp.float32(665.0),
+  )
+  assert bool(jnp.all(jnp.isfinite(g32_r)))
+  assert bool(jnp.all(jnp.isfinite(g32_p)))
+  assert bool(jnp.isfinite(g32_s))
+
+
+def test_apply_nalr_24khz_rejects_empty_and_non_1d_but_supports_vmap():
+  levels = _levels("clinical")
+  with pytest.raises(ValueError, match="non-empty 1-D"):
+    calibration.apply_nalr_24khz(jnp.zeros((2, 100)), SR, levels)
+  with pytest.raises(ValueError, match="non-empty 1-D"):
+    calibration.apply_nalr_24khz(jnp.zeros(0), SR, levels)
+  with pytest.raises(ValueError, match="non-empty 1-D"):
+    calibration.apply_nalr_24khz(jnp.asarray(1.0), SR, levels)
+
+  batch = jnp.stack(
+    [
+      jnp.asarray(_speech_like(duration=0.1, pad=0.0, seed=1)),
+      jnp.asarray(_speech_like(duration=0.1, pad=0.0, seed=2)),
+    ]
+  )
+  out = jax.vmap(calibration.apply_nalr_24khz, in_axes=(0, None, None))(
+    batch, SR, levels
+  )
+  assert out.shape == batch.shape
+  np.testing.assert_allclose(
+    np.asarray(out[0]),
+    np.asarray(calibration.apply_nalr_24khz(batch[0], SR, levels)),
+    rtol=1e-12,
+  )
 
 
 def test_apply_nalr_24khz_is_identity_for_normal_hearing():
