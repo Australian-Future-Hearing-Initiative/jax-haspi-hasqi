@@ -69,7 +69,8 @@ to `haspi_v2`, `hasqi_v2`, `haspi_v2_better_ear`, or `ear_model`. Internal
 arrays are rounded up to multiples of that duration with exact valid-length
 masking across resampling, alignment, the ear model, and the metric back ends,
 compiling once per bucket instead of once per unique clip length while matching
-unbucketed scores to machine precision (default `None` leaves shapes unchanged).
+unbucketed scores (`<= 1e-12` in `float64`; default `None` leaves shapes
+unchanged).
 
 Set `jax_compilation_cache_dir` to carry compilation across processes.
 
