@@ -37,10 +37,12 @@ silent and can reach 10 dB in the top band.
 > **Precision follows the caller's dtype.** In a default `float32` JAX process
 > (or when given `float32` inputs), both metrics execute in `float32` on CPU,
 > GPU, or TPU — the 4th-order gammatone cascade (`filters.cascaded_one_pole`)
-> and closed-form group delay keep `float32` within ~`6e-3` relative of
-> `pyclarity==0.9.0`. When `jax_enable_x64` is enabled and `float64` inputs are
-> passed (or wrapped with `precision.in_float64`), they execute in `float64` and
-> match `pyclarity==0.9.0` to ~`2.8e-8` relative.
+> and closed-form group delay keep `float32` within `3.8e-3` absolute on the
+> golden cases, though real speech (calibrated VCTK) drifts up to `1.87e-2` on
+> HASPI (`4.37e-3` on HASQI). When `jax_enable_x64` is enabled with `float64`
+> inputs — or when wrapped with `precision.in_float64`, which enables x64 and
+> promotes `float32` inputs to `float64` — they execute in `float64` and match
+> `pyclarity==0.9.0` to ~`2.8e-8` relative.
 
 ### Performance
 
