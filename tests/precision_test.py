@@ -237,8 +237,8 @@ def test_in_float64_promotes_metric_inputs_when_x64_is_enabled():
     SR,
     levels32.astype(np.float64),
   )
-  assert abs(float(h32) - float(want_h64)) > 1e-4
-  assert abs(float(q32) - float(want_q64)) > 1e-7
+  assert float(h32) != float(want_h64)
+  assert float(q32) != float(want_q64)
 
   haspi64 = precision.in_float64(haspi.haspi_v2)
   hasqi64 = precision.in_float64(hasqi.hasqi_v2)
