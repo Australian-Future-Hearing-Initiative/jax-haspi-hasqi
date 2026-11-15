@@ -1,6 +1,7 @@
 """Cochlear model shared by HASPI and HASQI, ported from clarity.evaluator.haspi.eb."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -106,6 +107,135 @@ def loss_parameters(hearing_loss, centre_freq):
   return attn_ohc, bandwidth, low_knee, compression_ratio, attn_ihc
 
 
+def _bucket_step(bucket_seconds):
+  """Convert an opt-in bucket duration in seconds to a 24 kHz sample step."""
+  if bucket_seconds is None:
+    return None
+  if isinstance(bucket_seconds, bool) or not isinstance(
+    bucket_seconds, (int, float, np.integer, np.floating)
+  ):
+    raise ValueError(
+      f"bucket_seconds must be a positive finite number, got {bucket_seconds!r}"
+    )
+  seconds = float(bucket_seconds)
+  if not math.isfinite(seconds) or seconds <= 0.0:
+    raise ValueError(
+      f"bucket_seconds must be positive and finite, got {bucket_seconds!r}"
+    )
+  step = int(round(seconds * _SAMPLE_RATE))
+  if step < 1:
+    raise ValueError(
+      f"bucket_seconds must be at least one 24 kHz sample, got {bucket_seconds!r}"
+    )
+  return step
+
+
+def _bucket_len(length, step):
+  """Round a sample count up to the next positive multiple of `step`."""
+  if step is None:
+    return length
+  return max(1, (length + step - 1) // step) * step
+
+
+def _resampled_len(n_in, sample_rate):
+  """Output length of resample_24khz for an input of length `n_in`."""
+  target_khz = int(np.round(_SAMPLE_RATE / 1000))
+  source_khz = int(np.round(sample_rate / 1000))
+  if source_khz == target_khz:
+    return n_in
+  factor = math.gcd(target_khz, source_khz)
+  up = target_khz // factor
+  down = source_khz // factor
+  n_out = n_in * up
+  return n_out // down + bool(n_out % down)
+
+
+def _pad_axis(arr, target_len, axis, dtype, length=None):
+  """Zero-pad (and optionally slice) `arr` along `axis` to `target_len`."""
+  limit = target_len if length is None else min(length, target_len)
+  if isinstance(arr, jax.core.Tracer):
+    arr = jnp.asarray(arr, dtype=dtype)
+    if arr.shape[axis] > limit:
+      arr = lax.slice_in_dim(arr, 0, limit, axis=axis)
+    pad = target_len - arr.shape[axis]
+    if pad <= 0:
+      return arr
+    widths = [(0, 0)] * arr.ndim
+    widths[axis] = (0, pad)
+    return jnp.pad(arr, widths)
+  if (
+    isinstance(arr, jax.Array)
+    and arr.shape[axis] == target_len
+    and limit >= target_len
+  ):
+    return jnp.asarray(arr, dtype=dtype)
+  # Pad on host when eager to avoid per-length XLA pad compilations.
+  host = np.asarray(arr, dtype=dtype)
+  if host.shape[axis] > limit:
+    slices = [slice(None)] * host.ndim
+    slices[axis] = slice(0, limit)
+    host = host[tuple(slices)]
+  pad = target_len - host.shape[axis]
+  if pad > 0:
+    widths = [(0, 0)] * host.ndim
+    widths[axis] = (0, pad)
+    host = np.pad(host, widths)
+  return jnp.asarray(host, dtype=dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("source_khz", "target_len"))
+def _resample_24khz_jitted(
+  signal, source_khz, valid_in=None, valid_out=None, target_len=None
+):
+  target_khz = int(np.round(_SAMPLE_RATE / 1000))
+  resampled = filters.resample_poly(signal, target_khz, source_khz)
+  if valid_in is not None:
+    in_mask = jnp.arange(signal.shape[0]) < valid_in
+    out_mask = jnp.arange(resampled.shape[0]) < valid_out
+    signal = jnp.where(in_mask, signal, 0.0)
+    resampled = jnp.where(out_mask, resampled, 0.0)
+    in_denom = jnp.maximum(valid_in, 1)
+    out_denom = jnp.maximum(valid_out, 1)
+  else:
+    in_denom = signal.shape[0]
+    out_denom = resampled.shape[0]
+
+  if source_khz < target_khz:
+    rms_out = _safe_sqrt(jnp.sum(resampled**2) / out_denom)
+    ratio = jnp.where(
+      rms_out > 0,
+      _safe_sqrt(jnp.sum(signal**2) / in_denom) / jnp.maximum(rms_out, _SMALL),
+      0.0,
+    )
+    out = ratio * resampled
+  else:
+    # Downsampling: compare RMS inside the 21 kHz band both filters pass.
+    order, attenuation = 7, 30
+    source_b, source_a = scipy.signal.cheby2(
+      order, attenuation, 21 / source_khz
+    )
+    target_b, target_a = scipy.signal.cheby2(
+      order, attenuation, 21 / target_khz
+    )
+    source_band = filters.lfilter(source_b, source_a, signal)
+    target_band = filters.lfilter(target_b, target_a, resampled)
+    if valid_in is not None:
+      source_band = jnp.where(in_mask, source_band, 0.0)
+      target_band = jnp.where(out_mask, target_band, 0.0)
+    rms_target = _safe_sqrt(jnp.sum(target_band**2) / out_denom)
+    ratio = jnp.where(
+      rms_target > 0,
+      _safe_sqrt(jnp.sum(source_band**2) / in_denom)
+      / jnp.maximum(rms_target, _SMALL),
+      0.0,
+    )
+    out = ratio * resampled
+
+  if target_len is not None and out.shape[0] < target_len:
+    out = jnp.pad(out, (0, target_len - out.shape[0]))
+  return out
+
+
 def resample_24khz(signal, sample_rate):
   """Resample to 24 kHz, matching RMS in the retained band.
 
@@ -118,40 +248,23 @@ def resample_24khz(signal, sample_rate):
   source_khz = int(np.round(sample_rate / 1000))
   if source_khz == target_khz:
     return signal
-
-  resampled = filters.resample_poly(signal, target_khz, source_khz)
-  if source_khz < target_khz:
-    rms_out = _safe_sqrt(jnp.mean(resampled**2))
-    ratio = jnp.where(
-      rms_out > 0,
-      _safe_sqrt(jnp.mean(signal**2)) / jnp.maximum(rms_out, _SMALL),
-      0.0,
-    )
-    return ratio * resampled
-
-  # Downsampling: compare RMS inside the 21 kHz band both filters pass.
-  order, attenuation = 7, 30
-  source_b, source_a = scipy.signal.cheby2(order, attenuation, 21 / source_khz)
-  target_b, target_a = scipy.signal.cheby2(order, attenuation, 21 / target_khz)
-  source_band = filters.lfilter(source_b, source_a, signal)
-  target_band = filters.lfilter(target_b, target_a, resampled)
-  rms_target = _safe_sqrt(jnp.mean(target_band**2))
-  ratio = jnp.where(
-    rms_target > 0,
-    _safe_sqrt(jnp.mean(source_band**2)) / jnp.maximum(rms_target, _SMALL),
-    0.0,
-  )
-  return ratio * resampled
+  return _resample_24khz_jitted(signal, source_khz)
 
 
 @functools.partial(jax.jit, static_argnames=("candidates",))
-def input_align(reference, processed, candidates=8):
+def input_align(reference, processed, candidates=8, valid_len=None):
   """Align the processed signal to the reference and prune leading silence.
 
   Shifts the active slice reference[start : stop + 1] to the front of a
   fixed-length array and zero-pads the remainder so the output shape is
   invariant to signal content. When no sample clears the silence threshold,
   returns all zeros with start=0 and stop=-1 (valid_len=0).
+
+  Args:
+    reference: Reference signal at 24 kHz.
+    processed: Processed signal at 24 kHz.
+    candidates: Number of top FFT correlation lags to re-evaluate directly.
+    valid_len: Optional active leading sample count when inputs are zero-padded.
 
   Returns:
     The aligned pair, and the (start, stop, delay) the alignment chose.
@@ -162,33 +275,82 @@ def input_align(reference, processed, candidates=8):
   processed_n = processed.shape[0]
   min_length = min(reference.shape[0], processed_n)
 
-  head_reference = reference[:min_length] - jnp.mean(reference[:min_length])
-  head_processed = processed[:min_length] - jnp.mean(processed[:min_length])
-  correlation = filters.correlate_full(
-    head_reference, head_processed, dtype=jnp.float32
-  )
-  shortlist = lax.top_k(
-    jnp.abs(correlation), min(candidates, 2 * min_length - 1)
-  )[1]
-  exact = jnp.abs(
-    filters.correlate_at_lags(head_reference, head_processed, shortlist)
-  )
+  head_reference = reference[:min_length]
+  head_processed = processed[:min_length]
+  if valid_len is None:
+    head_reference = head_reference - jnp.mean(head_reference)
+    head_processed = head_processed - jnp.mean(head_processed)
+    correlation = filters.correlate_full(
+      head_reference, head_processed, dtype=jnp.float32
+    )
+    shortlist = lax.top_k(
+      jnp.abs(correlation), min(candidates, 2 * min_length - 1)
+    )[1]
+    exact = jnp.abs(
+      filters.correlate_at_lags(head_reference, head_processed, shortlist)
+    )
+  else:
+    n_valid = jnp.clip(valid_len, 0, min_length)
+    valid_mask = jnp.arange(min_length) < n_valid
+    denom = jnp.maximum(n_valid, 1)
+    ref_masked = jnp.where(valid_mask, head_reference, 0.0)
+    proc_masked = jnp.where(valid_mask, head_processed, 0.0)
+    head_reference = jnp.where(
+      valid_mask, ref_masked - jnp.sum(ref_masked) / denom, 0.0
+    )
+    head_processed = jnp.where(
+      valid_mask, proc_masked - jnp.sum(proc_masked) / denom, 0.0
+    )
+    correlation = filters.correlate_full(
+      head_reference, head_processed, dtype=jnp.float32
+    )
+    corr_len = 2 * min_length - 1
+    corr_idx = jnp.arange(corr_len)
+    in_range = (corr_idx >= min_length - n_valid) & (
+      corr_idx < min_length + n_valid - 1
+    )
+    magnitude = jnp.where(in_range, jnp.abs(correlation), -jnp.inf)
+    shortlist = lax.top_k(magnitude, min(candidates, corr_len))[1]
+    shortlist_in_range = (shortlist >= min_length - n_valid) & (
+      shortlist < min_length + n_valid - 1
+    )
+    exact = jnp.abs(
+      filters.correlate_at_lags(head_reference, head_processed, shortlist)
+    )
+    exact = jnp.where(shortlist_in_range, exact, -jnp.inf)
+
   delay = min_length - shortlist[jnp.argmax(exact)] - 1
   # Back up 2 ms to allow for dispersion.
   delay = jnp.rint(delay - 2 * _SAMPLE_RATE / 1000.0).astype(jnp.int32)
 
-  above = jnp.abs(reference) > (0.001 * jnp.max(jnp.abs(reference)))
+  if valid_len is not None:
+    ref_mask = jnp.arange(reference.shape[0]) < n_valid
+    proc_mask = jnp.arange(processed_n) < n_valid
+    reference = jnp.where(ref_mask, reference, 0.0)
+    processed = jnp.where(proc_mask, processed, 0.0)
+    above = (
+      jnp.abs(reference) > (0.001 * jnp.max(jnp.abs(reference)))
+    ) & ref_mask
+    ref_limit = n_valid
+    proc_limit = n_valid
+  else:
+    above = jnp.abs(reference) > (0.001 * jnp.max(jnp.abs(reference)))
+    ref_limit = reference.shape[0]
+    proc_limit = processed_n
+
   any_above = jnp.any(above)
   delay = jnp.where(any_above, delay, 0)
   processed = filters.shift_with_zeros(processed, delay)
+  if valid_len is not None:
+    processed = jnp.where(proc_mask, processed, 0.0)
 
   start = jnp.where(any_above, jnp.argmax(above), 0).astype(jnp.int32)
   last_above = reference.shape[0] - 1 - jnp.argmax(above[::-1])
-  stop = jnp.where(any_above, jnp.minimum(last_above, processed_n), -1).astype(
+  stop = jnp.where(any_above, jnp.minimum(last_above, proc_limit), -1).astype(
     jnp.int32
   )
-  ref_valid = jnp.maximum(jnp.minimum(stop + 1, reference.shape[0]) - start, 0)
-  proc_valid = jnp.maximum(jnp.minimum(stop + 1, processed_n) - start, 0)
+  ref_valid = jnp.maximum(jnp.minimum(stop + 1, ref_limit) - start, 0)
+  proc_valid = jnp.maximum(jnp.minimum(stop + 1, proc_limit) - start, 0)
 
   aligned_reference = jnp.where(
     jnp.arange(reference.shape[0]) < ref_valid,
@@ -400,6 +562,11 @@ def envelope_align(
   # The clamp only bites for npts <= 4, far shorter than any real clip.
   shortlist = start + lax.top_k(window, min(candidates, stop - start))[1]
   exact = filters.correlate_at_lags(reference, output, shortlist)
+  if valid_len is not None:
+    shortlist_in_range = (shortlist >= npts - lags) & (
+      shortlist < jnp.minimum(npts + lags, npts + valid_len - 1)
+    )
+    exact = jnp.where(shortlist_in_range, exact, -jnp.inf)
   shift = (npts - 1) - shortlist[jnp.argmax(exact)]
   shifted = filters.shift_with_zeros(output, shift)
   if valid_len is not None:
@@ -737,9 +904,27 @@ def _ear_model_aligned(
 def _pad_noise(noise, shape, dtype):
   if noise is None:
     return jnp.zeros(shape, dtype=dtype)
-  noise = jnp.asarray(noise, dtype=dtype)
-  pad = max(shape[1] - noise.shape[1], 0)
-  return jnp.pad(noise, ((0, 0), (0, pad)))[:, : shape[1]]
+  return _pad_axis(noise, shape[1], 1, dtype)
+
+
+def _prepare_24khz(
+  signal, sample_rate, n_in, n_24k, shortest, bucket, step, dtype
+):
+  target_khz = int(np.round(_SAMPLE_RATE / 1000))
+  source_khz = int(np.round(sample_rate / 1000))
+  if source_khz == target_khz:
+    return _pad_axis(signal, bucket, 0, dtype, length=shortest)
+  sig_bucket = _bucket_len(n_24k, step)
+  in_bucket = max((sig_bucket * source_khz) // target_khz, 1)
+  padded = _pad_axis(signal, in_bucket, 0, dtype)
+  resampled = _resample_24khz_jitted(
+    padded,
+    source_khz,
+    valid_in=jnp.int32(n_in),
+    valid_out=jnp.int32(n_24k),
+    target_len=sig_bucket,
+  )
+  return resampled[:bucket] if sig_bucket != bucket else resampled
 
 
 def _run_ear_model(
@@ -754,19 +939,44 @@ def _run_ear_model(
   m_delay=1,
   reference_noise=None,
   processed_noise=None,
+  bucket_seconds=None,
 ):
+  step = _bucket_step(bucket_seconds)
   dtype = jnp.result_type(reference, processed, jnp.float32)
-  reference_24k = resample_24khz(
-    jnp.asarray(reference, dtype=dtype), reference_rate
-  )
-  processed_24k = resample_24khz(
-    jnp.asarray(processed, dtype=dtype), processed_rate
-  )
-
-  shortest = min(reference_24k.shape[0], processed_24k.shape[0])
-  reference_24k, processed_24k, (start, stop, _) = input_align(
-    reference_24k[:shortest], processed_24k[:shortest]
-  )
+  if step is None:
+    reference_24k = resample_24khz(
+      jnp.asarray(reference, dtype=dtype), reference_rate
+    )
+    processed_24k = resample_24khz(
+      jnp.asarray(processed, dtype=dtype), processed_rate
+    )
+    shortest = min(reference_24k.shape[0], processed_24k.shape[0])
+    reference_24k, processed_24k, (start, stop, _) = input_align(
+      reference_24k[:shortest], processed_24k[:shortest]
+    )
+  else:
+    n_ref = len(reference)
+    n_proc = len(processed)
+    n_ref_24k = _resampled_len(n_ref, reference_rate)
+    n_proc_24k = _resampled_len(n_proc, processed_rate)
+    shortest = min(n_ref_24k, n_proc_24k)
+    bucket = _bucket_len(shortest, step)
+    reference_24k = _prepare_24khz(
+      reference, reference_rate, n_ref, n_ref_24k, shortest, bucket, step, dtype
+    )
+    processed_24k = _prepare_24khz(
+      processed,
+      processed_rate,
+      n_proc,
+      n_proc_24k,
+      shortest,
+      bucket,
+      step,
+      dtype,
+    )
+    reference_24k, processed_24k, (start, stop, _) = input_align(
+      reference_24k, processed_24k, valid_len=jnp.int32(shortest)
+    )
   valid_len = jnp.maximum(stop - start + 1, 0)
 
   shape = (nchan, reference_24k.shape[0])
@@ -800,6 +1010,7 @@ def ear_model(
   m_delay=1,
   reference_noise=None,
   processed_noise=None,
+  bucket_seconds=None,
 ):
   """Middle ear, gammatone filter bank, OHC compression and IHC attenuation.
 
@@ -820,6 +1031,10 @@ def ear_model(
       Defaults to zeros, which makes the model deterministic; the reference
       draws from the unseeded global RNG instead.
     processed_noise: As above, for the processed signal.
+    bucket_seconds: Optional length-bucketing step in seconds. When set,
+      internal arrays are zero-padded up to the next multiple of this duration
+      (while preserving exact valid-length masking) so variable-length clips
+      compile once per bucket.
 
   Returns:
     Envelope and BM motion per band for each signal, the long-term dB SL
@@ -837,5 +1052,6 @@ def ear_model(
     m_delay=m_delay,
     reference_noise=reference_noise,
     processed_noise=processed_noise,
+    bucket_seconds=bucket_seconds,
   )
   return outputs[:7]

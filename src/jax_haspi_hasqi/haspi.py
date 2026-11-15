@@ -72,6 +72,7 @@ def haspi_v2(
   reference_noise=None,
   processed_noise=None,
   cepstral_noise=None,
+  bucket_seconds=None,
 ):
   """HASPI version 2 intelligibility index.
 
@@ -98,6 +99,10 @@ def haspi_v2(
     processed_noise: As above, for the processed signal.
     cepstral_noise: IHC firing dither for the two subsampled envelopes, in the
       post-silence-gate shape the reference draws it in.
+    bucket_seconds: Optional length-bucketing step in seconds. When set,
+      internal arrays are zero-padded up to the next multiple of this duration
+      so variable-length clips compile once per bucket instead of once per
+      unique clip length.
 
   Returns:
     The intelligibility estimate and the ten modulation-band correlations.
@@ -115,8 +120,18 @@ def haspi_v2(
       level1,
       reference_noise=reference_noise,
       processed_noise=processed_noise,
+      bucket_seconds=bucket_seconds,
     )
   )
+  if cepstral_noise is not None:
+    step = int(sample_rate // (8.0 * f_lp))
+    if step > 0:
+      nsamp = max(reference_db.shape)
+      nsub = (nsamp + step - 1) // step
+      cepstral_noise = (
+        ear_model._pad_axis(cepstral_noise[0], nsub, 0, reference_db.dtype),
+        ear_model._pad_axis(cepstral_noise[1], nsub, 0, reference_db.dtype),
+      )
   return _haspi_backend(
     reference_db,
     processed_db,
@@ -136,6 +151,7 @@ def haspi_v2_better_ear(
   hearing_loss_left,
   hearing_loss_right,
   level=100.0,
+  bucket_seconds=None,
 ):
   """HASPI for the better of the two ears."""
   left, _ = haspi_v2(
@@ -145,6 +161,7 @@ def haspi_v2_better_ear(
     sample_rate,
     hearing_loss_left,
     level,
+    bucket_seconds=bucket_seconds,
   )
   right, _ = haspi_v2(
     reference_right,
@@ -153,5 +170,6 @@ def haspi_v2_better_ear(
     sample_rate,
     hearing_loss_right,
     level,
+    bucket_seconds=bucket_seconds,
   )
   return jnp.maximum(left, right)
