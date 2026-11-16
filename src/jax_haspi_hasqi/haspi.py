@@ -123,15 +123,6 @@ def haspi_v2(
       bucket_seconds=bucket_seconds,
     )
   )
-  if cepstral_noise is not None and bucket_seconds is not None:
-    step = int(sample_rate // (8.0 * f_lp))
-    if step > 0:
-      nsamp = max(reference_db.shape)
-      nsub = (nsamp + step - 1) // step
-      cepstral_noise = (
-        ear_model._pad_axis(cepstral_noise[0], nsub, 0, reference_db.dtype),
-        ear_model._pad_axis(cepstral_noise[1], nsub, 0, reference_db.dtype),
-      )
   return _haspi_backend(
     reference_db,
     processed_db,

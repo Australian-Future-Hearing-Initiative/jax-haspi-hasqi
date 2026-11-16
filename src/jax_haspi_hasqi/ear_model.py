@@ -15,6 +15,7 @@ from jax_haspi_hasqi import nalr
 _EAR_Q = 9.26449
 _MIN_BANDWIDTH = 24.7
 _SAMPLE_RATE = 24000.0
+_TARGET_KHZ = int(np.round(_SAMPLE_RATE / 1000))
 _SMALL = 1e-30
 # Sentinel shift used if a group delay is non-finite. Large and negative so it
 # cannot be mistaken for a plausible alignment, unlike the INT_MIN that a
@@ -108,135 +109,79 @@ def loss_parameters(hearing_loss, centre_freq):
 
 
 def _bucket_step(bucket_seconds):
-  """Convert an opt-in bucket duration in seconds to a 24 kHz sample step."""
   if bucket_seconds is None:
     return None
-  if isinstance(bucket_seconds, bool) or not isinstance(
-    bucket_seconds, (int, float, np.integer, np.floating)
+  if (
+    isinstance(bucket_seconds, bool)
+    or not isinstance(bucket_seconds, (int, float, np.integer, np.floating))
+    or not math.isfinite(bucket_seconds)
+    or (step := int(round(float(bucket_seconds) * _SAMPLE_RATE))) < 1
   ):
-    raise ValueError(
-      f"bucket_seconds must be a positive finite number, got {bucket_seconds!r}"
-    )
-  seconds = float(bucket_seconds)
-  if not math.isfinite(seconds) or seconds <= 0.0:
-    raise ValueError(
-      f"bucket_seconds must be positive and finite, got {bucket_seconds!r}"
-    )
-  step = int(round(seconds * _SAMPLE_RATE))
-  if step < 1:
-    raise ValueError(
-      f"bucket_seconds must be at least one 24 kHz sample, got {bucket_seconds!r}"
-    )
+    raise ValueError(f"Invalid bucket_seconds: {bucket_seconds!r}")
   return step
 
 
 def _bucket_len(length, step):
-  """Round a sample count up to the next positive multiple of `step`."""
-  if step is None:
-    return length
   return max(1, (length + step - 1) // step) * step
 
 
-def _resampled_len(n_in, sample_rate):
-  """Output length of resample_24khz for an input of length `n_in`."""
-  target_khz = int(np.round(_SAMPLE_RATE / 1000))
-  source_khz = int(np.round(sample_rate / 1000))
-  if source_khz == target_khz:
+def _resampled_len(n_in, source_khz):
+  if source_khz == _TARGET_KHZ:
     return n_in
-  factor = math.gcd(target_khz, source_khz)
-  up = target_khz // factor
-  down = source_khz // factor
-  n_out = n_in * up
-  return n_out // down + bool(n_out % down)
+  factor = math.gcd(_TARGET_KHZ, source_khz)
+  up, down = _TARGET_KHZ // factor, source_khz // factor
+  return (n_in * up + down - 1) // down
 
 
-def _pad_axis(arr, target_len, axis, dtype, length=None, host_pad=True):
-  """Zero-pad (and optionally slice) `arr` along `axis` to `target_len`."""
-  limit = target_len if length is None else min(length, target_len)
-  if not host_pad or isinstance(arr, jax.core.Tracer):
-    arr = jnp.asarray(arr, dtype=dtype)
-    if arr.shape[axis] > limit:
-      arr = lax.slice_in_dim(arr, 0, limit, axis=axis)
-    pad = target_len - arr.shape[axis]
-    if pad <= 0:
-      return arr
-    widths = [(0, 0)] * arr.ndim
-    widths[axis] = (0, pad)
-    return jnp.pad(arr, widths)
-  if (
-    isinstance(arr, jax.Array)
-    and arr.shape[axis] == target_len
-    and limit >= target_len
-  ):
-    return jnp.asarray(arr, dtype=dtype)
+def _pad_1d(signal, target, dtype, limit=None):
+  if isinstance(signal, jax.core.Tracer):
+    arr = jnp.asarray(signal, dtype=dtype)[:limit]
+    return jnp.pad(arr, (0, max(target - arr.shape[0], 0)))[:target]
   # Pad on host when eager to avoid per-length XLA pad compilations.
-  host = np.asarray(arr, dtype=dtype)
-  if host.shape[axis] > limit:
-    slices = [slice(None)] * host.ndim
-    slices[axis] = slice(0, limit)
-    host = host[tuple(slices)]
-  pad = target_len - host.shape[axis]
-  if pad > 0:
-    widths = [(0, 0)] * host.ndim
-    widths[axis] = (0, pad)
-    host = np.pad(host, widths)
-  return jnp.asarray(host, dtype=dtype)
+  host = np.asarray(signal, dtype=dtype)[:limit]
+  pad = max(target - host.shape[0], 0)
+  if pad:
+    host = np.pad(host, (0, pad))
+  return jnp.asarray(host[:target], dtype=dtype)
 
 
 @functools.partial(jax.jit, static_argnames=("source_khz", "target_len"))
-def _resample_24khz_jitted(
+def _resample_24khz(
   signal, source_khz, valid_in=None, valid_out=None, target_len=None
 ):
-  target_khz = int(np.round(_SAMPLE_RATE / 1000))
   if valid_in is not None:
     in_mask = jnp.arange(signal.shape[0]) < valid_in
     signal = jnp.where(in_mask, signal, 0.0)
-  resampled = filters.resample_poly(signal, target_khz, source_khz)
+  resampled = filters.resample_poly(signal, _TARGET_KHZ, source_khz)
   if valid_in is not None:
     out_mask = jnp.arange(resampled.shape[0]) < valid_out
     resampled = jnp.where(out_mask, resampled, 0.0)
-    in_denom = jnp.maximum(valid_in, 1)
-    out_denom = jnp.maximum(valid_out, 1)
+    in_denom, out_denom = jnp.maximum(valid_in, 1), jnp.maximum(valid_out, 1)
   else:
-    in_denom = signal.shape[0]
-    out_denom = resampled.shape[0]
+    in_denom, out_denom = signal.shape[0], resampled.shape[0]
 
-  if source_khz < target_khz:
-    rms_out = _safe_sqrt(jnp.sum(resampled**2) / out_denom)
-    ratio = jnp.where(
-      rms_out > 0,
-      _safe_sqrt(jnp.sum(signal**2) / in_denom) / jnp.maximum(rms_out, _SMALL),
-      0.0,
-    )
-    out = ratio * resampled
+  if source_khz < _TARGET_KHZ:
+    source_band, target_band = signal, resampled
   else:
     # Downsampling: compare RMS inside the 21 kHz band both filters pass.
-    order, attenuation = 7, 30
-    source_b, source_a = scipy.signal.cheby2(
-      order, attenuation, 21 / source_khz
-    )
-    target_b, target_a = scipy.signal.cheby2(
-      order, attenuation, 21 / target_khz
-    )
+    source_b, source_a = scipy.signal.cheby2(7, 30, 21 / source_khz)
+    target_b, target_a = scipy.signal.cheby2(7, 30, 21 / _TARGET_KHZ)
     source_band = filters.lfilter(source_b, source_a, signal)
     target_band = filters.lfilter(target_b, target_a, resampled)
     if valid_in is not None:
       source_band = jnp.where(in_mask, source_band, 0.0)
       target_band = jnp.where(out_mask, target_band, 0.0)
-    rms_target = _safe_sqrt(jnp.sum(target_band**2) / out_denom)
-    ratio = jnp.where(
-      rms_target > 0,
-      _safe_sqrt(jnp.sum(source_band**2) / in_denom)
-      / jnp.maximum(rms_target, _SMALL),
-      0.0,
-    )
-    out = ratio * resampled
 
-  if target_len is not None:
-    if out.shape[0] < target_len:
-      out = jnp.pad(out, (0, target_len - out.shape[0]))
-    elif out.shape[0] > target_len:
-      out = out[:target_len]
+  rms_target = _safe_sqrt(jnp.sum(target_band**2) / out_denom)
+  ratio = jnp.where(
+    rms_target > 0,
+    _safe_sqrt(jnp.sum(source_band**2) / in_denom)
+    / jnp.maximum(rms_target, _SMALL),
+    0.0,
+  )
+  out = ratio * resampled
+  if target_len is not None and out.shape[0] != target_len:
+    out = jnp.pad(out, (0, max(target_len - out.shape[0], 0)))[:target_len]
   return out
 
 
@@ -248,11 +193,10 @@ def resample_24khz(signal, sample_rate):
   """
   dtype = jnp.result_type(signal, jnp.float32)
   signal = jnp.asarray(signal, dtype=dtype)
-  target_khz = int(np.round(_SAMPLE_RATE / 1000))
   source_khz = int(np.round(sample_rate / 1000))
-  if source_khz == target_khz:
+  if source_khz == _TARGET_KHZ:
     return signal
-  return _resample_24khz_jitted(signal, source_khz)
+  return _resample_24khz(signal, source_khz)
 
 
 @functools.partial(jax.jit, static_argnames=("candidates",))
@@ -263,12 +207,6 @@ def input_align(reference, processed, candidates=8, valid_len=None):
   fixed-length array and zero-pads the remainder so the output shape is
   invariant to signal content. When no sample clears the silence threshold,
   returns all zeros with start=0 and stop=-1 (valid_len=0).
-
-  Args:
-    reference: Reference signal at 24 kHz.
-    processed: Processed signal at 24 kHz.
-    candidates: Number of top FFT correlation lags to re-evaluate directly.
-    valid_len: Optional active leading sample count when inputs are zero-padded.
 
   Returns:
     The aligned pair, and the (start, stop, delay) the alignment chose.
@@ -284,18 +222,24 @@ def input_align(reference, processed, candidates=8, valid_len=None):
   if valid_len is None:
     head_reference = head_reference - jnp.mean(head_reference)
     head_processed = head_processed - jnp.mean(head_processed)
+    ref_limit, proc_limit = reference.shape[0], processed_n
   else:
     n_valid = jnp.clip(valid_len, 0, min_length)
     valid_mask = jnp.arange(min_length) < n_valid
     denom = jnp.maximum(n_valid, 1)
-    ref_masked = jnp.where(valid_mask, head_reference, 0.0)
-    proc_masked = jnp.where(valid_mask, head_processed, 0.0)
+    head_reference = jnp.where(valid_mask, head_reference, 0.0)
+    head_processed = jnp.where(valid_mask, head_processed, 0.0)
     head_reference = jnp.where(
-      valid_mask, ref_masked - jnp.sum(ref_masked) / denom, 0.0
+      valid_mask, head_reference - jnp.sum(head_reference) / denom, 0.0
     )
     head_processed = jnp.where(
-      valid_mask, proc_masked - jnp.sum(proc_masked) / denom, 0.0
+      valid_mask, head_processed - jnp.sum(head_processed) / denom, 0.0
     )
+    reference = jnp.where(
+      jnp.arange(reference.shape[0]) < n_valid, reference, 0.0
+    )
+    processed = jnp.where(jnp.arange(processed_n) < n_valid, processed, 0.0)
+    ref_limit = proc_limit = n_valid
 
   correlation = filters.correlate_full(
     head_reference, head_processed, dtype=jnp.float32
@@ -303,45 +247,26 @@ def input_align(reference, processed, candidates=8, valid_len=None):
   corr_len = 2 * min_length - 1
   magnitude = jnp.abs(correlation)
   if valid_len is not None:
+    lo, hi = min_length - n_valid, min_length + n_valid - 1
     corr_idx = jnp.arange(corr_len)
-    in_range = (corr_idx >= min_length - n_valid) & (
-      corr_idx < min_length + n_valid - 1
+    magnitude = jnp.where(
+      (corr_idx >= lo) & (corr_idx < hi), magnitude, -jnp.inf
     )
-    magnitude = jnp.where(in_range, magnitude, -jnp.inf)
   shortlist = lax.top_k(magnitude, min(candidates, corr_len))[1]
   exact = jnp.abs(
     filters.correlate_at_lags(head_reference, head_processed, shortlist)
   )
   if valid_len is not None:
-    shortlist_in_range = (shortlist >= min_length - n_valid) & (
-      shortlist < min_length + n_valid - 1
-    )
-    exact = jnp.where(shortlist_in_range, exact, -jnp.inf)
+    exact = jnp.where((shortlist >= lo) & (shortlist < hi), exact, -jnp.inf)
 
   delay = min_length - shortlist[jnp.argmax(exact)] - 1
   # Back up 2 ms to allow for dispersion.
   delay = jnp.rint(delay - 2 * _SAMPLE_RATE / 1000.0).astype(jnp.int32)
 
-  if valid_len is not None:
-    ref_mask = jnp.arange(reference.shape[0]) < n_valid
-    proc_mask = jnp.arange(processed_n) < n_valid
-    reference = jnp.where(ref_mask, reference, 0.0)
-    processed = jnp.where(proc_mask, processed, 0.0)
-    above = (
-      jnp.abs(reference) > (0.001 * jnp.max(jnp.abs(reference)))
-    ) & ref_mask
-    ref_limit = n_valid
-    proc_limit = n_valid
-  else:
-    above = jnp.abs(reference) > (0.001 * jnp.max(jnp.abs(reference)))
-    ref_limit = reference.shape[0]
-    proc_limit = processed_n
-
+  above = jnp.abs(reference) > (0.001 * jnp.max(jnp.abs(reference)))
   any_above = jnp.any(above)
   delay = jnp.where(any_above, delay, 0)
   processed = filters.shift_with_zeros(processed, delay)
-  if valid_len is not None:
-    processed = jnp.where(proc_mask, processed, 0.0)
 
   start = jnp.where(any_above, jnp.argmax(above), 0).astype(jnp.int32)
   last_above = reference.shape[0] - 1 - jnp.argmax(above[::-1])
@@ -900,26 +825,23 @@ def _ear_model_aligned(
   )
 
 
-def _pad_noise(noise, shape, dtype, host_pad=False):
+def _pad_noise(noise, shape, dtype):
   if noise is None:
     return jnp.zeros(shape, dtype=dtype)
-  return _pad_axis(noise, shape[1], 1, dtype, host_pad=host_pad)
+  noise = jnp.asarray(noise, dtype=dtype)
+  pad = max(shape[1] - noise.shape[1], 0)
+  return jnp.pad(noise, ((0, 0), (0, pad)))[:, : shape[1]]
 
 
-def _prepare_24khz(
-  signal, sample_rate, n_in, n_24k, shortest, bucket, step, dtype
-):
-  target_khz = int(np.round(_SAMPLE_RATE / 1000))
-  source_khz = int(np.round(sample_rate / 1000))
-  if source_khz == target_khz:
-    return _pad_axis(signal, bucket, 0, dtype, length=shortest)
+def _prepare_24khz(signal, source_khz, n_24k, shortest, bucket, step, dtype):
+  if source_khz == _TARGET_KHZ:
+    return _pad_1d(signal, bucket, dtype, limit=shortest)
   sig_bucket = _bucket_len(n_24k, step)
-  in_bucket = max((sig_bucket * source_khz) // target_khz, 1)
-  padded = _pad_axis(signal, in_bucket, 0, dtype)
-  resampled = _resample_24khz_jitted(
-    padded,
+  in_bucket = max((sig_bucket * source_khz) // _TARGET_KHZ, 1)
+  resampled = _resample_24khz(
+    _pad_1d(signal, in_bucket, dtype),
     source_khz,
-    valid_in=jnp.int32(n_in),
+    valid_in=jnp.int32(len(signal)),
     valid_out=jnp.int32(n_24k),
     target_len=sig_bucket,
   )
@@ -954,24 +876,17 @@ def _run_ear_model(
       reference_24k[:shortest], processed_24k[:shortest]
     )
   else:
-    n_ref = len(reference)
-    n_proc = len(processed)
-    n_ref_24k = _resampled_len(n_ref, reference_rate)
-    n_proc_24k = _resampled_len(n_proc, processed_rate)
+    ref_khz = int(np.round(reference_rate / 1000))
+    proc_khz = int(np.round(processed_rate / 1000))
+    n_ref_24k = _resampled_len(len(reference), ref_khz)
+    n_proc_24k = _resampled_len(len(processed), proc_khz)
     shortest = min(n_ref_24k, n_proc_24k)
     bucket = _bucket_len(shortest, step)
     reference_24k = _prepare_24khz(
-      reference, reference_rate, n_ref, n_ref_24k, shortest, bucket, step, dtype
+      reference, ref_khz, n_ref_24k, shortest, bucket, step, dtype
     )
     processed_24k = _prepare_24khz(
-      processed,
-      processed_rate,
-      n_proc,
-      n_proc_24k,
-      shortest,
-      bucket,
-      step,
-      dtype,
+      processed, proc_khz, n_proc_24k, shortest, bucket, step, dtype
     )
     reference_24k, processed_24k, (start, stop, _) = input_align(
       reference_24k, processed_24k, valid_len=jnp.int32(shortest)
@@ -979,9 +894,8 @@ def _run_ear_model(
   valid_len = jnp.maximum(stop - start + 1, 0)
 
   shape = (nchan, reference_24k.shape[0])
-  host_pad = step is not None
-  reference_noise = _pad_noise(reference_noise, shape, dtype, host_pad=host_pad)
-  processed_noise = _pad_noise(processed_noise, shape, dtype, host_pad=host_pad)
+  reference_noise = _pad_noise(reference_noise, shape, dtype)
+  processed_noise = _pad_noise(processed_noise, shape, dtype)
 
   outputs = _ear_model_aligned(
     reference_24k,
