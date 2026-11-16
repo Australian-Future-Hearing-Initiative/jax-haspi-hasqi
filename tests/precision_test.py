@@ -47,53 +47,6 @@ print(f"DTYPE {before} {after}")
 """
 
 
-_IN_FLOAT64_FROM_FLOAT32_SCRIPT = """
-import jax
-import jax.numpy as jnp
-import numpy as np
-
-from jax_haspi_hasqi import haspi, hasqi, precision
-
-assert not jax.config.jax_enable_x64, "expected a float32 process"
-before = jnp.zeros(1).dtype
-
-levels = np.array([21.0, 26.0, 30.0, 32.0, 33.0, 33.0], dtype=np.float32)
-rng = np.random.default_rng(3)
-t = np.arange(12000) / 24000
-ref = 0.5 * np.sin(2 * np.pi * 220 * t) * (1 + 0.5 * np.sin(2 * np.pi * 3 * t))
-proc = (ref + 0.02 * rng.standard_normal(len(ref))).astype(np.float32)
-ref = ref.astype(np.float32)
-
-haspi64 = precision.in_float64(haspi.haspi_v2)
-hasqi64 = precision.in_float64(hasqi.hasqi_v2)
-
-h_np, hc_np = haspi64(ref, 24000, proc, 24000, levels)
-q_np, qnl_np, ql_np, qr_np = hasqi64(ref, 24000, proc, 24000, levels)
-
-jref, jproc, jlevels = (
-  jnp.asarray(ref),
-  jnp.asarray(proc),
-  jnp.asarray(levels),
-)
-assert jref.dtype == jnp.float32
-h_jnp, hc_jnp = haspi64(jref, 24000, jproc, 24000, jlevels)
-q_jnp, qnl_jnp, ql_jnp, qr_jnp = hasqi64(jref, 24000, jproc, 24000, jlevels)
-
-after = jnp.zeros(1).dtype
-assert not jax.config.jax_enable_x64
-
-print(f"HASPI_NP {float(h_np)!r} {h_np.dtype} {hc_np.dtype}")
-print(f"HASPI_JNP {float(h_jnp)!r} {h_jnp.dtype} {hc_jnp.dtype}")
-print(
-  f"HASQI_NP {float(q_np)!r} {q_np.dtype} {qnl_np.dtype} {ql_np.dtype} {qr_np.dtype}"
-)
-print(
-  f"HASQI_JNP {float(q_jnp)!r} {q_jnp.dtype} {qnl_jnp.dtype} {ql_jnp.dtype} {qr_jnp.dtype}"
-)
-print(f"DTYPE {before} {after}")
-"""
-
-
 def _signals(n=12000, seed=3):
   rng = np.random.default_rng(seed)
   t = np.arange(n) / SR
@@ -210,9 +163,9 @@ def test_require_x64_still_available_for_callers_who_want_it():
     assert "precision.in_float64" in str(exc_info.value)
 
 
-def test_in_float64_promotes_metric_inputs_when_x64_is_enabled():
-  """`in_float64` promotes float32 inputs even when x64 is already enabled."""
-  assert jax.config.jax_enable_x64
+@pytest.mark.parametrize("x64_before", (False, True))
+def test_in_float64_promotes_metric_inputs(x64_before):
+  """`in_float64` promotes float32 inputs regardless of prior x64 state."""
   ref, proc = _signals()
   ref32 = ref.astype(np.float32)
   proc32 = proc.astype(np.float32)
@@ -243,60 +196,22 @@ def test_in_float64_promotes_metric_inputs_when_x64_is_enabled():
 
   haspi64 = precision.in_float64(haspi.haspi_v2)
   hasqi64 = precision.in_float64(hasqi.hasqi_v2)
+  expected_caller_dtype = jnp.float64 if x64_before else jnp.float32
 
-  for r, p, lv in (
-    (ref32, proc32, levels32),
-    (jnp.asarray(ref32), jnp.asarray(proc32), jnp.asarray(levels32)),
-  ):
-    h, h_corr = haspi64(r, SR, p, SR, lv)
-    q, q_nl, q_lin, q_raw = hasqi64(r, SR, p, SR, lv)
-    assert h.dtype == h_corr.dtype == jnp.float64
-    assert q.dtype == q_nl.dtype == q_lin.dtype == q_raw.dtype == jnp.float64
-    assert float(h) == float(want_h64)
-    assert float(q) == float(want_q64)
-
-
-def test_in_float64_promotes_metric_inputs_from_float32_process():
-  """From a float32 process, `in_float64` runs in float64 and restores x64."""
-  result = subprocess.run(
-    [sys.executable, "-c", _IN_FLOAT64_FROM_FLOAT32_SCRIPT],
-    capture_output=True,
-    text=True,
-    check=True,
-  )
-  lines = dict(
-    line.split(" ", 1) for line in result.stdout.strip().splitlines()
-  )
-  assert lines["DTYPE"] == "float32 float32"
-
-  ref, proc = _signals()
-  ref32 = ref.astype(np.float32)
-  proc32 = proc.astype(np.float32)
-  levels32 = LEVELS.astype(np.float32)
-  want_h64, _ = haspi.haspi_v2(
-    ref32.astype(np.float64),
-    SR,
-    proc32.astype(np.float64),
-    SR,
-    levels32.astype(np.float64),
-  )
-  want_q64, *_ = hasqi.hasqi_v2(
-    ref32.astype(np.float64),
-    SR,
-    proc32.astype(np.float64),
-    SR,
-    levels32.astype(np.float64),
-  )
-
-  for key in ("HASPI_NP", "HASPI_JNP"):
-    val, *dtypes = lines[key].split()
-    assert dtypes == ["float64", "float64"]
-    assert float(val) == float(want_h64)
-
-  for key in ("HASQI_NP", "HASQI_JNP"):
-    val, *dtypes = lines[key].split()
-    assert dtypes == ["float64", "float64", "float64", "float64"]
-    assert float(val) == float(want_q64)
+  with jax.enable_x64(x64_before):
+    assert jnp.zeros(1).dtype == expected_caller_dtype
+    for r, p, lv in (
+      (ref32, proc32, levels32),
+      (jnp.asarray(ref32), jnp.asarray(proc32), jnp.asarray(levels32)),
+    ):
+      h, h_corr = haspi64(r, SR, p, SR, lv)
+      q, q_nl, q_lin, q_raw = hasqi64(r, SR, p, SR, lv)
+      assert h.dtype == h_corr.dtype == jnp.float64
+      assert q.dtype == q_nl.dtype == q_lin.dtype == q_raw.dtype == jnp.float64
+      assert float(h) == float(want_h64)
+      assert float(q) == float(want_q64)
+    assert jax.config.jax_enable_x64 is x64_before
+    assert jnp.zeros(1).dtype == expected_caller_dtype
 
 
 class _Pair(NamedTuple):
