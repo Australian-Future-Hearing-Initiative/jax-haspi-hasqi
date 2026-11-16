@@ -1,6 +1,7 @@
 """Opt-in length bucketing: parity, compilation reuse, transforms, and edges."""
 
 import contextlib
+import inspect
 import pathlib
 import re
 import tempfile
@@ -72,6 +73,7 @@ def test_multiple_buckets_compile_once_per_bucket():
 @pytest.mark.parametrize("sample_rate", [24000, 16000, 48000])
 def test_single_bucket_compiles_once_across_lengths_and_rates(sample_rate):
   """Clips in the same bucket share one compiled binary at every stage."""
+  jax.clear_caches()
   fractions = (0.20, 0.31, 0.42, 0.50)
   clips = [
     _signal_pair(int(round(sample_rate * frac)), sample_rate, seed=i)
@@ -344,11 +346,14 @@ def test_float32_matches_unbucketed_with_bucketing(sample_rate):
 
 
 @pytest.mark.parametrize("itype", [0, 1, 2])
-def test_ear_model_bucketed_shape_and_values(itype):
-  """ear_model pads 2-D outputs to bucket multiples with exact zero tails."""
+def test_run_ear_model_bucketed_shape_and_values(itype):
+  """_run_ear_model pads 2-D outputs to bucket multiples with exact zero tails."""
+  assert (
+    "bucket_seconds" not in inspect.signature(ear_model.ear_model).parameters
+  )
   ref, proc = _signal_pair(6000, 24000, seed=itype)
-  base = ear_model.ear_model(ref, 24000, proc, 24000, LEVELS, itype, 65.0)
-  bkt = ear_model.ear_model(
+  base = ear_model._run_ear_model(ref, 24000, proc, 24000, LEVELS, itype, 65.0)
+  bkt = ear_model._run_ear_model(
     ref, 24000, proc, 24000, LEVELS, itype, 65.0, bucket_seconds=0.5
   )
 
@@ -364,6 +369,7 @@ def test_ear_model_bucketed_shape_and_values(itype):
       np.asarray(bkt[idx]), np.asarray(base[idx]), atol=1e-12
     )
   assert bkt[6] == 24000.0
+  assert int(bkt[7]) == int(base[7])
 
 
 def test_clip_length_boundary_and_rollover():
@@ -371,10 +377,10 @@ def test_clip_length_boundary_and_rollover():
   exact_ref, exact_proc = _signal_pair(6000, 24000, seed=1)
   over_ref, over_proc = _signal_pair(6001, 24000, seed=2)
 
-  exact_out = ear_model.ear_model(
+  exact_out = ear_model._run_ear_model(
     exact_ref, 24000, exact_proc, 24000, LEVELS, 0, 65.0, bucket_seconds=0.25
   )
-  over_out = ear_model.ear_model(
+  over_out = ear_model._run_ear_model(
     over_ref, 24000, over_proc, 24000, LEVELS, 0, 65.0, bucket_seconds=0.25
   )
   assert exact_out[0].shape == (32, 6000)
@@ -383,6 +389,21 @@ def test_clip_length_boundary_and_rollover():
 
 def test_haspi_v2_better_ear_bucketed_matches_unbucketed():
   """haspi_v2_better_ear forwards bucket_seconds and shares compilations."""
+  warm_l, warm_pl = _signal_pair(5000, 24000, seed=12)
+  warm_r, warm_pr = _signal_pair(7000, 24000, seed=13)
+  jax.block_until_ready(
+    haspi.haspi_v2_better_ear(
+      warm_l,
+      warm_r,
+      warm_pl,
+      warm_pr,
+      24000,
+      LEVELS,
+      LEVELS * 0.5,
+      bucket_seconds=0.5,
+    )
+  )
+
   ref_l, proc_l = _signal_pair(6000, 24000, seed=10)
   ref_r, proc_r = _signal_pair(9000, 24000, seed=11)
   want = haspi.haspi_v2_better_ear(
@@ -423,10 +444,6 @@ def test_haspi_v2_better_ear_bucketed_matches_unbucketed():
 def test_invalid_bucket_seconds_raises(bad_value):
   ref, proc = _signal_pair(1200, 24000, seed=0)
   with pytest.raises(ValueError, match="bucket_seconds"):
-    ear_model.ear_model(
-      ref, 24000, proc, 24000, LEVELS, 0, 65.0, bucket_seconds=bad_value
-    )
-  with pytest.raises(ValueError, match="bucket_seconds"):
     haspi.haspi_v2(ref, 24000, proc, 24000, LEVELS, bucket_seconds=bad_value)
   with pytest.raises(ValueError, match="bucket_seconds"):
     hasqi.hasqi_v2(ref, 24000, proc, 24000, LEVELS, bucket_seconds=bad_value)
@@ -437,29 +454,50 @@ def test_invalid_bucket_seconds_raises(bad_value):
 
 
 def test_short_and_degenerate_clips_with_bucketing():
-  """Short (250, 400), silent, and NaN clips match unbucketed behaviour."""
+  """Short (250, 350, 400), low-threshold, silent, and NaN clips match."""
   rng = np.random.default_rng(7)
-  for n in (250, 400):
+  cases = (
+    (250, LEVELS, 65.0),
+    (350, np.zeros(6), 100.0),
+    (400, LEVELS, 65.0),
+  )
+  for n, levels, level1 in cases:
     ref = rng.standard_normal(n) * 0.2
     proc = ref + 0.01 * rng.standard_normal(n)
-    assert (
-      abs(
-        float(haspi.haspi_v2(ref, 24000, proc, 24000, LEVELS)[0])
-        - float(
-          haspi.haspi_v2(ref, 24000, proc, 24000, LEVELS, bucket_seconds=0.5)[0]
-        )
-      )
-      <= 1e-12
+    h_base, _ = haspi.haspi_v2(ref, 24000, proc, 24000, levels, level1=level1)
+    h_bkt, _ = haspi.haspi_v2(
+      ref, 24000, proc, 24000, levels, level1=level1, bucket_seconds=0.5
     )
-    assert (
-      abs(
-        float(hasqi.hasqi_v2(ref, 24000, proc, 24000, LEVELS)[0])
-        - float(
-          hasqi.hasqi_v2(ref, 24000, proc, 24000, LEVELS, bucket_seconds=0.5)[0]
-        )
-      )
-      <= 1e-12
+    assert abs(float(h_base) - float(h_bkt)) <= 1e-12
+
+    q_base, nl_base, lin_base, raw_base = hasqi.hasqi_v2(
+      ref, 24000, proc, 24000, levels, level1=level1
     )
+    q_bkt, nl_bkt, lin_bkt, raw_bkt = hasqi.hasqi_v2(
+      ref, 24000, proc, 24000, levels, level1=level1, bucket_seconds=0.5
+    )
+    assert abs(float(q_base) - float(q_bkt)) <= 1e-12
+    assert abs(float(nl_base) - float(nl_bkt)) <= 1e-12
+    assert abs(float(lin_base) - float(lin_bkt)) <= 1e-12
+    np.testing.assert_allclose(
+      np.asarray(raw_bkt), np.asarray(raw_base), atol=1e-12
+    )
+
+  # Low silence_threshold below -100 dB must still exclude padded frames.
+  r_low, p_low = _signal_pair(6000, 24000, seed=14)
+  q_low_base, *_ = hasqi.hasqi_v2(
+    r_low, 24000, p_low, 24000, LEVELS, silence_threshold=-200.0
+  )
+  q_low_bkt, *_ = hasqi.hasqi_v2(
+    r_low,
+    24000,
+    p_low,
+    24000,
+    LEVELS,
+    silence_threshold=-200.0,
+    bucket_seconds=0.5,
+  )
+  assert abs(float(q_low_base) - float(q_low_bkt)) <= 1e-12
 
   nan_ref = np.full(2400, np.nan)
   ones = np.ones(2400)
@@ -477,6 +515,51 @@ def test_short_and_degenerate_clips_with_bucketing():
   )
 
 
+@pytest.mark.parametrize("sample_rate", [48000, 96000])
+def test_short_high_rate_resampling_does_not_crash(sample_rate):
+  """Short downsampled clips with up==1 and n < len(taps) run cleanly."""
+  x = np.linspace(-0.2, 0.2, 10)
+  out = ear_model.resample_24khz(x, sample_rate)
+  assert np.all(np.isfinite(np.asarray(out)))
+
+  h_base, _ = haspi.haspi_v2(x, sample_rate, x, sample_rate, LEVELS)
+  h_bkt, _ = haspi.haspi_v2(
+    x, sample_rate, x, sample_rate, LEVELS, bucket_seconds=0.01
+  )
+  q_bkt, *_ = hasqi.hasqi_v2(
+    x, sample_rate, x, sample_rate, LEVELS, bucket_seconds=0.01
+  )
+  assert abs(float(h_base) - float(h_bkt)) <= 1e-12
+  assert np.isfinite(float(q_bkt))
+
+
+@pytest.mark.parametrize("sample_rate", [16000, 24000, 48000])
+def test_empty_clip_with_single_sample_bucket(sample_rate):
+  """Empty clips with 1-sample buckets slice resampled output to target_len."""
+  empty = np.zeros(0)
+  out = ear_model._run_ear_model(
+    empty,
+    sample_rate,
+    empty,
+    sample_rate,
+    LEVELS,
+    0,
+    65.0,
+    bucket_seconds=1 / 24000,
+  )
+  assert out[0].shape == (32, 1)
+  assert int(out[7]) == 0
+
+  h, _ = haspi.haspi_v2(
+    empty, sample_rate, empty, sample_rate, LEVELS, bucket_seconds=0.05
+  )
+  q, *_ = hasqi.hasqi_v2(
+    empty, sample_rate, empty, sample_rate, LEVELS, bucket_seconds=0.05
+  )
+  assert float(h) == 0.0
+  assert float(q) == 0.0
+
+
 def test_input_align_and_envelope_align_valid_len_edge_cases():
   """valid_len isolates active prefix from tail values, NaNs, and tiny lengths."""
   r3 = jnp.array([1.0, -2.0, 0.5])
@@ -491,6 +574,22 @@ def test_input_align_and_envelope_align_valid_len_edge_cases():
   np.testing.assert_array_equal(np.asarray(b2[:3]), np.asarray(b1))
   np.testing.assert_array_equal(np.asarray(a2[3:]), 0.0)
   np.testing.assert_array_equal(np.asarray(b2[3:]), 0.0)
+
+  # _resample_24khz_jitted masks non-zero/NaN tails before filtering.
+  sig = jnp.linspace(-0.2, 0.2, 40)
+  sig_dirty = jnp.concatenate([sig, jnp.full(40, np.nan)])
+  res_clean = ear_model.resample_24khz(sig, 16000)
+  res_masked = ear_model._resample_24khz_jitted(
+    sig_dirty,
+    16,
+    valid_in=jnp.int32(40),
+    valid_out=jnp.int32(60),
+    target_len=120,
+  )
+  np.testing.assert_allclose(
+    np.asarray(res_masked[:60]), np.asarray(res_clean), atol=1e-12
+  )
+  np.testing.assert_array_equal(np.asarray(res_masked[60:]), 0.0)
 
   # valid_len=0 returns empty alignment even when tail is non-zero.
   a0, b0, (s0, e0, d0) = ear_model.input_align(

@@ -123,7 +123,7 @@ def haspi_v2(
       bucket_seconds=bucket_seconds,
     )
   )
-  if cepstral_noise is not None:
+  if cepstral_noise is not None and bucket_seconds is not None:
     step = int(sample_rate // (8.0 * f_lp))
     if step > 0:
       nsamp = max(reference_db.shape)

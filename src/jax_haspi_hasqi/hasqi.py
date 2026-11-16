@@ -105,9 +105,9 @@ def env_smooth(
     / half_sum
   )
   out = jnp.concatenate([first[:, None], middle, last[:, None]], axis=1)
-  idx = jnp.arange(max_nseg)
+  idx = jnp.arange(out.shape[1])
   out = jnp.where(idx[None, :] == (nseg - 1), last[:, None], out)
-  return jnp.where(idx[None, :] < nseg, out, dtype.type(-100.0))
+  return jnp.where(idx[None, :] < nseg, out, dtype.type(-1e6))
 
 
 def _mel_cepstrum_basis(nbands, nbasis=_CEPSTRAL_COEFFICIENTS):
@@ -313,7 +313,7 @@ def bm_covary(
       [first[index][:, None], middle[index], last[index][:, None]], axis=1
     )
     if valid_len is not None:
-      idx = jnp.arange(max_nseg)
+      idx = jnp.arange(out.shape[1])
       out = jnp.where(idx[None, :] == (nseg - 1), last[index][:, None], out)
       out = jnp.where(idx[None, :] < nseg, out, zero)
     return out

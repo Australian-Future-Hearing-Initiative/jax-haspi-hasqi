@@ -150,10 +150,10 @@ def _resampled_len(n_in, sample_rate):
   return n_out // down + bool(n_out % down)
 
 
-def _pad_axis(arr, target_len, axis, dtype, length=None):
+def _pad_axis(arr, target_len, axis, dtype, length=None, host_pad=True):
   """Zero-pad (and optionally slice) `arr` along `axis` to `target_len`."""
   limit = target_len if length is None else min(length, target_len)
-  if isinstance(arr, jax.core.Tracer):
+  if not host_pad or isinstance(arr, jax.core.Tracer):
     arr = jnp.asarray(arr, dtype=dtype)
     if arr.shape[axis] > limit:
       arr = lax.slice_in_dim(arr, 0, limit, axis=axis)
@@ -188,11 +188,12 @@ def _resample_24khz_jitted(
   signal, source_khz, valid_in=None, valid_out=None, target_len=None
 ):
   target_khz = int(np.round(_SAMPLE_RATE / 1000))
-  resampled = filters.resample_poly(signal, target_khz, source_khz)
   if valid_in is not None:
     in_mask = jnp.arange(signal.shape[0]) < valid_in
-    out_mask = jnp.arange(resampled.shape[0]) < valid_out
     signal = jnp.where(in_mask, signal, 0.0)
+  resampled = filters.resample_poly(signal, target_khz, source_khz)
+  if valid_in is not None:
+    out_mask = jnp.arange(resampled.shape[0]) < valid_out
     resampled = jnp.where(out_mask, resampled, 0.0)
     in_denom = jnp.maximum(valid_in, 1)
     out_denom = jnp.maximum(valid_out, 1)
@@ -231,8 +232,11 @@ def _resample_24khz_jitted(
     )
     out = ratio * resampled
 
-  if target_len is not None and out.shape[0] < target_len:
-    out = jnp.pad(out, (0, target_len - out.shape[0]))
+  if target_len is not None:
+    if out.shape[0] < target_len:
+      out = jnp.pad(out, (0, target_len - out.shape[0]))
+    elif out.shape[0] > target_len:
+      out = out[:target_len]
   return out
 
 
@@ -280,15 +284,6 @@ def input_align(reference, processed, candidates=8, valid_len=None):
   if valid_len is None:
     head_reference = head_reference - jnp.mean(head_reference)
     head_processed = head_processed - jnp.mean(head_processed)
-    correlation = filters.correlate_full(
-      head_reference, head_processed, dtype=jnp.float32
-    )
-    shortlist = lax.top_k(
-      jnp.abs(correlation), min(candidates, 2 * min_length - 1)
-    )[1]
-    exact = jnp.abs(
-      filters.correlate_at_lags(head_reference, head_processed, shortlist)
-    )
   else:
     n_valid = jnp.clip(valid_len, 0, min_length)
     valid_mask = jnp.arange(min_length) < n_valid
@@ -301,21 +296,25 @@ def input_align(reference, processed, candidates=8, valid_len=None):
     head_processed = jnp.where(
       valid_mask, proc_masked - jnp.sum(proc_masked) / denom, 0.0
     )
-    correlation = filters.correlate_full(
-      head_reference, head_processed, dtype=jnp.float32
-    )
-    corr_len = 2 * min_length - 1
+
+  correlation = filters.correlate_full(
+    head_reference, head_processed, dtype=jnp.float32
+  )
+  corr_len = 2 * min_length - 1
+  magnitude = jnp.abs(correlation)
+  if valid_len is not None:
     corr_idx = jnp.arange(corr_len)
     in_range = (corr_idx >= min_length - n_valid) & (
       corr_idx < min_length + n_valid - 1
     )
-    magnitude = jnp.where(in_range, jnp.abs(correlation), -jnp.inf)
-    shortlist = lax.top_k(magnitude, min(candidates, corr_len))[1]
+    magnitude = jnp.where(in_range, magnitude, -jnp.inf)
+  shortlist = lax.top_k(magnitude, min(candidates, corr_len))[1]
+  exact = jnp.abs(
+    filters.correlate_at_lags(head_reference, head_processed, shortlist)
+  )
+  if valid_len is not None:
     shortlist_in_range = (shortlist >= min_length - n_valid) & (
       shortlist < min_length + n_valid - 1
-    )
-    exact = jnp.abs(
-      filters.correlate_at_lags(head_reference, head_processed, shortlist)
     )
     exact = jnp.where(shortlist_in_range, exact, -jnp.inf)
 
@@ -901,10 +900,10 @@ def _ear_model_aligned(
   )
 
 
-def _pad_noise(noise, shape, dtype):
+def _pad_noise(noise, shape, dtype, host_pad=False):
   if noise is None:
     return jnp.zeros(shape, dtype=dtype)
-  return _pad_axis(noise, shape[1], 1, dtype)
+  return _pad_axis(noise, shape[1], 1, dtype, host_pad=host_pad)
 
 
 def _prepare_24khz(
@@ -980,8 +979,9 @@ def _run_ear_model(
   valid_len = jnp.maximum(stop - start + 1, 0)
 
   shape = (nchan, reference_24k.shape[0])
-  reference_noise = _pad_noise(reference_noise, shape, dtype)
-  processed_noise = _pad_noise(processed_noise, shape, dtype)
+  host_pad = step is not None
+  reference_noise = _pad_noise(reference_noise, shape, dtype, host_pad=host_pad)
+  processed_noise = _pad_noise(processed_noise, shape, dtype, host_pad=host_pad)
 
   outputs = _ear_model_aligned(
     reference_24k,
@@ -1010,7 +1010,6 @@ def ear_model(
   m_delay=1,
   reference_noise=None,
   processed_noise=None,
-  bucket_seconds=None,
 ):
   """Middle ear, gammatone filter bank, OHC compression and IHC attenuation.
 
@@ -1031,10 +1030,6 @@ def ear_model(
       Defaults to zeros, which makes the model deterministic; the reference
       draws from the unseeded global RNG instead.
     processed_noise: As above, for the processed signal.
-    bucket_seconds: Optional length-bucketing step in seconds. When set,
-      internal arrays are zero-padded up to the next multiple of this duration
-      (while preserving exact valid-length masking) so variable-length clips
-      compile once per bucket.
 
   Returns:
     Envelope and BM motion per band for each signal, the long-term dB SL
@@ -1052,6 +1047,5 @@ def ear_model(
     m_delay=m_delay,
     reference_noise=reference_noise,
     processed_noise=processed_noise,
-    bucket_seconds=bucket_seconds,
   )
   return outputs[:7]
