@@ -151,7 +151,9 @@ def group_delay_at_dc(b, a):
 def upfirdn(h, x, up, down):
   """scipy.signal.upfirdn: zero-stuff by up, FIR filter, keep every down-th sample."""
   n = x.shape[0]
-  stuffed = jnp.zeros((n - 1) * up + 1, x.dtype).at[::up].set(x)
+  stuffed = (
+    x if up == 1 else jnp.zeros((n - 1) * up + 1, x.dtype).at[::up].set(x)
+  )
   return jnp.convolve(stuffed, jnp.asarray(h, x.dtype), "full")[::down]
 
 

@@ -105,9 +105,9 @@ def env_smooth(
     / half_sum
   )
   out = jnp.concatenate([first[:, None], middle, last[:, None]], axis=1)
-  idx = jnp.arange(max_nseg)
+  idx = jnp.arange(out.shape[1])
   out = jnp.where(idx[None, :] == (nseg - 1), last[:, None], out)
-  return jnp.where(idx[None, :] < nseg, out, dtype.type(-100.0))
+  return jnp.where(idx[None, :] < nseg, out, dtype.type(-1e6))
 
 
 def _mel_cepstrum_basis(nbands, nbasis=_CEPSTRAL_COEFFICIENTS):
@@ -313,7 +313,7 @@ def bm_covary(
       [first[index][:, None], middle[index], last[index][:, None]], axis=1
     )
     if valid_len is not None:
-      idx = jnp.arange(max_nseg)
+      idx = jnp.arange(out.shape[1])
       out = jnp.where(idx[None, :] == (nseg - 1), last[index][:, None], out)
       out = jnp.where(idx[None, :] < nseg, out, zero)
     return out
@@ -455,6 +455,7 @@ def hasqi_v2(
   segment_covariance=_SEGMENT_COVARIANCE,
   reference_noise=None,
   processed_noise=None,
+  bucket_seconds=None,
 ):
   """HASQI version 2 quality index.
 
@@ -484,6 +485,10 @@ def hasqi_v2(
     segment_covariance: Segment size in ms.
     reference_noise: Threshold noise for the reference's BM motion.
     processed_noise: As above, for the processed signal.
+    bucket_seconds: Optional length-bucketing step in seconds. When set,
+      internal arrays are zero-padded up to the next multiple of this duration
+      so variable-length clips compile once per bucket instead of once per
+      unique clip length.
 
   Returns:
     The combined score, its nonlinear and linear parts, and the four raw terms
@@ -508,6 +513,7 @@ def hasqi_v2(
     level1,
     reference_noise=reference_noise,
     processed_noise=processed_noise,
+    bucket_seconds=bucket_seconds,
   )
 
   cepstral_correlation, bm_sync5, d_loud, d_slope = _hasqi_backend(

@@ -64,6 +64,16 @@ fixed-length arrays rather than cropping to data-dependent shapes, clips of the
 same length never trigger XLA recompilation and both `haspi_v2` and `hasqi_v2`
 can be wrapped directly in an outer `jax.jit`.
 
+For variable-length datasets, pass `bucket_seconds` (e.g. `bucket_seconds=1.0`)
+to `haspi_v2`, `hasqi_v2`, or `haspi_v2_better_ear`. Internal arrays are
+rounded up to multiples of that duration with exact valid-length masking across
+resampling, alignment, the ear model, and the metric back ends, compiling once
+per bucket instead of once per unique clip length (default `None` leaves shapes
+unchanged). Bucketed scores match unbucketed ones within `1e-12` in `float64`;
+in `float32`, padded resampling introduces small rounding drift (up to ~`8e-5`
+on HASPI for `rate_16000` and ~`8.5e-4` on HASQI for `rate_mismatch_24k_16k`,
+well within `float32`'s overall drift).
+
 Set `jax_compilation_cache_dir` to carry compilation across processes.
 
 ## What it is faithful to
