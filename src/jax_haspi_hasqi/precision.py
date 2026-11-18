@@ -20,19 +20,23 @@ factor intact:
 With those in place float32 runs end to end on every golden case: worst
 relative error 1.30% on the final score, worst absolute 3.8e-03, no raises.
 The one case above 1% is a HASQI score of 0.0763, where 1.30% is 9.9e-04
-absolute.
+absolute. On real speech (VCTK, calibrated to 65 dB SPL), float32 drifts
+further from float64: up to 1.87e-02 on HASPI and 4.37e-03 on HASQI.
 
 `haspi_v2`, `hasqi_v2` and `ear_model` compute in the floating-point dtype of
 their inputs (`jnp.result_type(reference, processed, jnp.float32)`): float32 in
 a default JAX process or when given float32 arrays, and float64 when x64 is
-enabled and the inputs are float64. `in_float64` and `require_x64` remain
-available for callers that want explicit double-precision promotion.
+enabled and the inputs are float64. `in_float64` enables x64 for the call and
+promotes floating-point inputs to float64; `require_x64` asserts that x64 is
+enabled.
 """
 
 import contextlib
 import functools
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 
 
 @contextlib.contextmanager
@@ -42,12 +46,31 @@ def _x64():
     yield
 
 
+def _promote_float64(x):
+  if isinstance(x, (jax.Array, np.ndarray, np.generic)):
+    if jnp.issubdtype(x.dtype, jnp.floating):
+      return x if x.dtype == np.float64 else x.astype(np.float64)
+    if jnp.issubdtype(x.dtype, jnp.complexfloating):
+      return x if x.dtype == np.complex128 else x.astype(np.complex128)
+  return x
+
+
 def in_float64(fn):
   """Run `fn` under float64 whatever the caller has configured.
 
+  Enables `jax_enable_x64` for the duration of the call, restores the caller's
+  setting on exit, and promotes floating-point (`float64`) and complex
+  (`complex128`) array/scalar inputs in `*args` and `**kwargs` (including
+  nested pytrees) before calling `fn`, even when `jax_enable_x64` is already
+  enabled. Non-floating arguments are left unchanged (integer PCM arrays must
+  be cast to float first).
+
   The jit cache survives the toggle, so this costs nothing after the first
   call for a given shape: 2.04 s cold, then 0.18 s and 0.17 s warm, measured
-  from a float32 process.
+  from a float32 process. When combining with outer JAX transforms (`jax.jit`,
+  `jax.grad`, etc.) from a float32 process, wrap the transformed callable
+  (`in_float64(jax.jit(fn))`, `in_float64(jax.grad(fn))`), since enabling x64
+  inside a trace does not persist across JAX tracing or reverse passes.
 
   Args:
     fn: The function to wrap.
@@ -58,9 +81,8 @@ def in_float64(fn):
 
   @functools.wraps(fn)
   def wrapper(*args, **kwargs):
-    if jax.config.jax_enable_x64:
-      return fn(*args, **kwargs)
     with _x64():
+      args, kwargs = jax.tree_util.tree_map(_promote_float64, (args, kwargs))
       return fn(*args, **kwargs)
 
   return wrapper
@@ -70,16 +92,18 @@ def require_x64():
   """Raise unless JAX is configured for float64.
 
   Retained for callers who want to assert the process-wide setting rather than
-  rely on the promotion in `in_float64`. The public entry points no longer call
-  this: they promote instead.
+  wrapping calls with `in_float64`. The public entry points do not call this
+  and preserve the caller's input dtype instead.
 
   Raises:
-    RuntimeError: If x64 is disabled, naming both ways to enable it.
+    RuntimeError: If x64 is disabled, naming how to enable it.
   """
   if not jax.config.jax_enable_x64:
     raise RuntimeError(
       "jax-haspi-hasqi requires float64. Enable it globally with "
-      "jax.config.update('jax_enable_x64', True), or scope it to the call "
-      "with `with jax.enable_x64(True):`. float32 does run, but agrees with "
-      "the reference only to about 1% rather than 1e-09."
+      "jax.config.update('jax_enable_x64', True), scope it with "
+      "`with jax.enable_x64(True):` (with float64 inputs), or wrap the call "
+      "with `precision.in_float64` to also promote float32 inputs. float32 "
+      "does run, but drifts up to ~1.9e-2 on real speech rather than ~2.8e-8 "
+      "relative in float64."
     )
