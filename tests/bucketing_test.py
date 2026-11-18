@@ -102,6 +102,7 @@ def test_unequal_lengths_and_goldens_match_unbucketed():
     "speech_snr20",
     "reference_silent",
     "processed_silent",
+    "rate_mismatch_24k_16k",
   ):
     c = goldens.case(name)
     args = (
