@@ -98,7 +98,7 @@ def test_loss_parameters_match(name):
 # both the basis and the sum in extended precision still lands at 2.8e-15, so
 # this is a floor rather than something to tune away. Only the audiograms that
 # actually exercise it get the looser bound.
-NALR_TAP_TOLERANCE = {"clinical": 5e-15}
+NALR_TAP_TOLERANCE = {"clinical": 1e-14}
 
 
 @pytest.mark.parametrize("name", AUDIOGRAMS)
@@ -107,9 +107,11 @@ def test_nalr_filter_matches(name):
 
   Held at 1e-15 except where noted in NALR_TAP_TOLERANCE. For context on the
   size of that exception: before the design stopped using an FFT, clinical sat
-  at 2.6e-17 and flat_zero at exactly 0. clinical now measures 2.9e-15. The
-  taps are worth far less than that downstream -- the change moves HASQI by at
-  most 3e-10, against an ear model that already differs from the reference by
+  at 2.6e-17 and flat_zero at exactly 0. Direct evaluation of the 513-bin dot
+  product lands at 2.9e-15 under pairwise/SIMD reduction and 6.6e-15 under
+  sequential accumulation (including XLA:CPU's XTile GEMV emitter). The taps are
+  worth far less than that downstream -- the change moves HASQI by at most
+  3e-10, against an ear model that already differs from the reference by
   2.8e-08 -- but the step is two orders of magnitude, so it is named here
   rather than absorbed into a blanket bound.
   """
